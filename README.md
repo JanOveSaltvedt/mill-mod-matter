@@ -15,10 +15,38 @@ Both device types share endpoint 1: Electrical Sensor is a *utility* device type
 Core spec 9.2.1 allows any number of those beside the single application one — so the
 thermostat can meter itself without a second endpoint.
 
-> **Milestone 1: the heater interface is simulated.** Commissioning, Thread, SRP, the
-> data model and NVS persistence are all real. `src/heater.rs` fakes the room
-> temperature and a 1 kW element; it is the only module that real hardware I/O
-> replaces.
+> **The mod is not a relay driver.** The Mill's own microcontroller keeps the
+> temperature sensor, the triac and the whole control loop. This board replaces the
+> heater's **WiFi module** and speaks that module's 9600-baud UART protocol: it
+> receives status frames and sends setpoint and on/off requests. So the thermostat
+> is an advisory peer - it reports what the heater is doing, including a setpoint
+> somebody changed on the front panel, and asks for changes it cannot enforce.
+> `MILL-HARDWARE-INTERFACE.md` documents the protocol, byte by byte.
+
+> **Not yet run against real hardware.** The UART half is written and builds, but
+> every open question in `MILL-HARDWARE-INTERFACE.md` - the status cadence, the true
+> frame length, whether the Mill validates the checksum it is sent - is still open.
+> The first eight frames are logged raw, at `info`, for exactly that reason.
+
+## Wiring
+
+| ESP32-C6 | Mill |
+| --- | --- |
+| `GPIO16` | RX of the heater's MCU (ESP → Mill) |
+| `GPIO17` | TX of the heater's MCU (Mill → ESP) |
+| GND | GND |
+
+9600 8N1, no flow control, 3.3 V TTL — the header carried an **HF-LPT120A** WiFi
+module. Pin order, the supply rail and whether the Mill can feed a C6 with the
+Thread radio running are **not** documented anywhere; confirm them against the
+physical board before wiring anything up.
+
+`GPIO16`/`GPIO17` are also the C6's default UART0 console pins, so the Mill gets
+UART1 and the log console is pinned to USB Serial/JTAG. `espflash --monitor` already
+talks over USB, so this costs nothing — but the monitor and the Mill cannot share
+pins, and the ROM bootloader's own chatter at reset does go out to the heater.
+
+`GPIO9` (Boot Mode) stays free for the factory reset.
 
 ## Prerequisites
 
@@ -52,9 +80,16 @@ a QR code plus a manual pairing code. Scan it from your controller's phone app. 
 `rs-matter`'s test attestation and the CSA test VID/PID, which is expected on a
 private fabric.
 
-Once commissioned, the monitor shows the simulation running: `Heater: heating ON/OFF`
-as the hysteresis band opens and closes the relay, and a simulated front-panel press
-nudging the setpoint once a minute.
+Once commissioned, the monitor shows the link to the heater: the first few status
+frames raw (`Mill: RX 5A ...`, with the gap since the previous one), then
+`Mill: element ON/OFF` as the Mill's own control loop works, and
+`Thermostat: the heater's setpoint moved to 22C on its own` when somebody turns the
+knob on the front panel. Writes go the other way as `Mill: requesting ...`.
+
+If the log instead fills with `Mill: dropping malformed frame`, the raw bytes are in
+the warning: either the wiring is wrong or the Mill computes its checksum
+differently from `src/mill.rs`. If nothing arrives at all, `LocalTemperature` reads
+null and `Mill: no status frame for 120 s` appears once.
 
 ## Poking at it with chip-tool
 
@@ -69,7 +104,10 @@ chip-tool electricalenergymeasurement read cumulative-energy-imported <node-id> 
 chip-tool electricalenergymeasurement subscribe-event cumulative-energy-measured 1 10 <node-id> 1
 ```
 
-`active-power` reads `1000000` (mW) while the relay is closed and `0` otherwise.
+`active-power` reads `600000` (mW) while the Mill has the element on and `0`
+otherwise — the element's plate rating gated on one bit of the status frame. There
+is no metering hardware in the heater and none was added, so that rating is worth
+confirming against the unit being modded.
 
 ## Persistence and factory reset
 
@@ -84,6 +122,11 @@ commissioning with default setpoints and a zeroed energy counter. Remove the dev
 from your controller as well, or it will keep trying to reach the old fabric.
 
 ## Documentation
+
+`MILL-HARDWARE-INTERFACE.md` is the protocol reference: the framing, the status
+frame's offsets, the two command frames with worked examples, the defects of the
+ESPHome implementation it was reverse-engineered from, and the questions still to be
+answered on hardware.
 
 `CLAUDE.md` carries the working notes: the four-repository layout and why the
 `[patch.crates-io]` entries exist, where each part of `main.rs` was ported from, and a

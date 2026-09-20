@@ -1,9 +1,12 @@
 //! The Electrical Sensor device type's device-specific half: what the heater's
 //! heating element is drawing right now, and what it has drawn over its lifetime.
 //!
-//! Both readings come from [`SimulatedHeater`]; a real metering chip would replace
-//! the derivations here with measurements, which is the whole reason the spec has
-//! the RMS and apparent quantities as separate readings rather than deriving them.
+//! There is no metering hardware. The Mill reports whether its element is on and
+//! nothing more, so every reading here is the element's plate rating gated on
+//! that one bit, and the rest is derived from the nominal supply - which is the
+//! whole reason the spec keeps the RMS and apparent quantities as separate
+//! readings rather than deriving them. A current-sense chip would replace the
+//! derivations in [`MillHeater`] and leave this module alone.
 
 use core::cell::Cell;
 
@@ -22,7 +25,8 @@ use rs_matter_embassy::matter::tlv::Nullable;
 use rs_matter_embassy::matter::with;
 
 use crate::heater::{
-    SimulatedHeater, METER_TICK, SUPPLY_FREQUENCY_MHZ, SUPPLY_VOLTAGE_MV, TICK, UNITY_POWER_FACTOR,
+    MillHeater, ENERGY_PERIOD, METER_TICK, SUPPLY_FREQUENCY_MHZ, SUPPLY_VOLTAGE_MV,
+    UNITY_POWER_FACTOR,
 };
 
 /// The top of the metering hardware's measurable range, in milliamps.
@@ -68,14 +72,14 @@ macro_rules! meter_accuracy {
 
 /// What the element is drawing right now.
 pub struct ElecPwrDeviceLogic<'a> {
-    heater: &'a SimulatedHeater<'a>,
+    heater: &'a MillHeater<'a>,
     /// The last `ActivePower` handed to a subscriber, so that
     /// [`ElecPwrMeasHooks::run`] only notifies when the reading actually moved.
     reported_power_mw: Cell<i64>,
 }
 
 impl<'a> ElecPwrDeviceLogic<'a> {
-    pub fn new(heater: &'a SimulatedHeater<'a>) -> Self {
+    pub fn new(heater: &'a MillHeater<'a>) -> Self {
         Self {
             heater,
             reported_power_mw: Cell::new(heater.active_power_mw()),
@@ -179,8 +183,9 @@ impl ElecPwrMeasHooks for ElecPwrDeviceLogic<'_> {
 
     async fn run<F: Fn(elec_pwr_meas::OutOfBandMessage)>(&self, notify: F) {
         loop {
-            // In a real device we would wait on the metering chip rather than poll
-            // a simulation.
+            // Sampling rather than waiting on an event: the element state this
+            // is derived from arrives on the Mill's own schedule, which the
+            // thermostat loop owns. A metering chip would be awaited here instead.
             embassy_time::Timer::after(METER_TICK).await;
 
             let power = self.heater.active_power_mw();
@@ -188,7 +193,7 @@ impl ElecPwrMeasHooks for ElecPwrDeviceLogic<'_> {
             if power != self.reported_power_mw.get() {
                 self.reported_power_mw.set(power);
 
-                // Every served reading is derived from the same relay state, so
+                // Every served reading is derived from the same element state, so
                 // they all move together.
                 notify(elec_pwr_meas::OutOfBandMessage::Update);
             }
@@ -198,11 +203,11 @@ impl ElecPwrMeasHooks for ElecPwrDeviceLogic<'_> {
 
 /// What the element has drawn over the device's lifetime.
 pub struct ElecEnergyDeviceLogic<'a> {
-    heater: &'a SimulatedHeater<'a>,
+    heater: &'a MillHeater<'a>,
 }
 
 impl<'a> ElecEnergyDeviceLogic<'a> {
-    pub fn new(heater: &'a SimulatedHeater<'a>) -> Self {
+    pub fn new(heater: &'a MillHeater<'a>) -> Self {
         Self { heater }
     }
 }
@@ -260,7 +265,7 @@ impl ElecEnergyMeasHooks for ElecEnergyDeviceLogic<'_> {
 
     async fn run<F: Fn(elec_energy_meas::OutOfBandMessage)>(&self, notify: F) {
         loop {
-            embassy_time::Timer::after(TICK).await;
+            embassy_time::Timer::after(ENERGY_PERIOD).await;
 
             // Closing the period here rather than in the thermostat's own tick
             // keeps the energy counter owned by the cluster that reports it.

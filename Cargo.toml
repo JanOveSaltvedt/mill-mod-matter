@@ -79,7 +79,18 @@ esp-alloc = { version = "0.11" }
 esp-storage = { version = "0.10", features = ["esp32c6", "embedded-storage"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32c6", "log-04"] }
 esp-metadata-generated = { version = "0.5", features = ["esp32c6"] }
-esp-println = { version = "0.18", features = ["esp32c6", "log-04"] }
+# `jtag-serial` rather than the default `auto`: the Mill owns GPIO16/17, which are
+# also UART0's default console pins, so the log console has to be pinned to the USB
+# Serial/JTAG peripheral. `auto` would fall back to UART0 whenever no USB host is
+# attached and spray log lines at the heater's MCU. `colors` and `critical-section`
+# are the rest of the default set, kept.
+esp-println = { version = "0.18", default-features = false, features = [
+    "esp32c6",
+    "log-04",
+    "jtag-serial",
+    "colors",
+    "critical-section",
+] }
 esp-backtrace = { version = "0.20", features = ["esp32c6", "panic-handler", "println"] }
 
 # The C6 is single-core but `esp-rtos` needs real atomics across its interrupt

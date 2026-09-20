@@ -8,6 +8,12 @@ Firmware for a **hardware mod to a Mill Gen 2 WiFi panel heater**: its WiFi
 controller is replaced with an ESP32-C6 that presents the heater to Matter as a
 heating Thermostat over **Thread**, metering its own heating element.
 
+The mod does **not** drive a relay and does **not** read a thermistor. The Mill's
+own MCU keeps the sensor, the triac and the whole control loop; this board replaces
+the WiFi module and speaks that module's 9600-baud UART protocol - it *receives*
+status and *sends* setpoint and on/off requests. `MILL-HARDWARE-INTERFACE.md` is the
+reference for every byte of it.
+
 `no_std`, no-alloc-except-where-forced, single `embassy` executor task. One binary,
 built from `src/main.rs`.
 
@@ -17,11 +23,9 @@ built from `src/main.rs`.
 
 | | |
 | --- | --- |
-| Milestone 1 (**done**) | Real BLE commissioning, Thread join, SRP, data model and NVS persistence. The *heater interface* is simulated - `src/heater.rs` fakes the room and the element. |
-| Next | Replace `src/heater.rs` with real I/O: relay/triac drive, NTC or onboard temperature sensing, the Mill front-panel buttons and display. |
-
-Nothing outside `src/heater.rs` knows the load is fictitious, which is the point: the
-Matter half was made provable without the hardware being finished.
+| Milestone 1 (**done**) | Real BLE commissioning, Thread join, SRP, data model and NVS persistence, against a simulated heater. |
+| Milestone 2 (**written, not yet run on hardware**) | The real Mill UART: `src/mill.rs` (wire protocol) and `src/heater.rs` (UART + reported state) replaced the simulation, and `src/thermostat.rs` lost its control loop. |
+| Next | Bench bring-up. The nine open questions at the end of `MILL-HARDWARE-INTERFACE.md` are all answered by logs from a wired unit; the first frames are logged raw at `info` on purpose. |
 
 ## The four repositories
 
@@ -94,10 +98,13 @@ readelf -lW target/riscv32imac-unknown-none-elf/release/mill-mod-matter |
 
 ```
 src/main.rs        stack wiring, the `NODE` metadata, the handler chain, NVS store,
-                   factory reset
-src/heater.rs      SimulatedHeater: the room model, the relay, the energy counters.
-                   The ONLY module real hardware replaces.
-src/thermostat.rs  ThermostatHooks - heating-only, setpoints persisted
+                   factory reset, the Mill UART's construction
+src/mill.rs        the wire protocol: framing, checksum, the status frame, the two
+                   command frames. Pure logic, no peripherals.
+src/heater.rs      MillHeater: the UART halves, the state the Mill reports, the energy
+                   counters. The ONLY module that touches hardware.
+src/thermostat.rs  ThermostatHooks - heating-only, setpoints persisted, no control
+                   loop (the Mill owns that)
 src/meter.rs       ElecPwrMeasHooks + ElecEnergyMeasHooks - what the element draws
 src/vendor_kv.rs   object-safe view of the Matter KV store + our key constants
 ```
@@ -181,6 +188,40 @@ Each of these cost real investigation. None is obvious from the code.
 - **The device is uncertified.** It ships `rs-matter`'s test DAC/PAI and the CSA test
   VID/PID, so every commissioner warns about it. Expected on a private fabric.
 
+### The Mill link
+
+- **GPIO16/17 are UART0's default console pins.** The Mill takes them, so the
+  console is pinned to USB Serial/JTAG (`esp-println`'s `jtag-serial` feature,
+  `default-features = false`) and the Mill gets UART1. Leaving `esp-println` on its
+  default `auto` would have it fall back to UART0 whenever no USB host is attached
+  and spray log lines at the heater's MCU. The ROM bootloader still talks on UART0 at
+  reset; nothing can be done about that and the Mill ignores it.
+- **The lifetime on `MillHeater`'s UART halves is `'static`, deliberately.** They have
+  destructors, so a borrowed lifetime would have to outlive the heater's own drop -
+  and `ThermostatDeviceLogic` holds `&'a MillHeater<'a>`, which *is* that lifetime.
+  Borrow-check fails with a dropck error that does not name the real cause.
+- **The RX half is an `embassy_sync` `Mutex`, not a `RefCell`**, because it is held
+  across an await (`clippy::await_holding_refcell_ref`).
+- **`ThermostatHooks::apply` fires once at startup**, from the handler's `repair()`,
+  before anything can have been written and before the Mill has said a word. That
+  call must *not* push the restored state onto the heater - somebody may have turned
+  the knob while the board was rebooting - so `ThermostatDeviceLogic` skips the
+  first `apply` and adopts the Mill's state from the first status frame instead.
+- **Commands are fire-and-forget.** No ack, no sequence number. A command is
+  confirmed only by a later status frame echoing it, which is what the
+  `pending_setpoint`/`pending_mode` grace window in `thermostat.rs` is for: a status
+  frame that disagrees with a command sent moments ago has probably just crossed it
+  on the wire.
+- **Every status frame feeds the silence watchdog**, including one identical to the
+  last. `MillHeater::recv_status` therefore resolves on *any* status frame, not only
+  on one that changed something - a steady-state heater repeating itself must not look
+  like a heater that has stopped talking.
+- **ESPHome's implementation has real defects** - it breaks frames on `0x0A` (which
+  is a room temperature of exactly 10 degC), never verifies a received checksum, and
+  overruns its command buffer by one byte. `MILL-HARDWARE-INTERFACE.md` lists them
+  under "Known weaknesses"; none is reproduced here. Do not "fix" `mill.rs` to match
+  the C++.
+
 ## Conventions
 
 - **No allocation, no large stack values.** The heap exists only for OpenThread /
@@ -191,6 +232,7 @@ Each of these cost real investigation. None is obvious from the code.
   subscriptions, KV scratch buffer). Don't raise a number in code; pick the feature.
 - Logging is plain `log::{info, warn, error}` - this is a downstream crate, so
   `rs-matter`'s internal `crate::fmt` rule does not apply.
-- Keep `heater.rs` the only module that would need hardware. If a change to
-  `thermostat.rs` or `meter.rs` starts wanting a peripheral, put the peripheral
-  behind a `heater.rs` method instead.
+- Keep `heater.rs` the only module that touches a peripheral. If a change to
+  `thermostat.rs` or `meter.rs` starts wanting one, put it behind a `heater.rs`
+  method instead. Protocol logic belongs in `mill.rs`, which stays free of
+  `esp-hal` so it can be reasoned about (and `const`-asserted) on its own.

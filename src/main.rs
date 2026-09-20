@@ -2,17 +2,17 @@
 //! Mill Gen 2 panel heater, replacing its WiFi controller.
 //!
 //! Endpoint 1 carries two device types. The Thermostat (`0x0301`, `HEAT`) is backed
-//! by [`SimulatedHeater`]: the local temperature drifts towards the heating setpoint
-//! while `SystemMode` is `Heat`, and back towards ambient otherwise. Beside it sits
-//! an Electrical Sensor (`0x0510`) - a *utility* device type, so the two share an
-//! endpoint - reporting the heating element through Power Topology, Electrical Power
-//! Measurement and Electrical Energy Measurement: what the element draws while the
-//! relay is closed, and how much energy it has drawn over the device's lifetime.
+//! by [`MillHeater`], which is not a relay driver: the Mill's own microcontroller
+//! keeps the temperature sensor, the triac and the control loop, and this board
+//! replaces only the WiFi module that used to advise it over a 9600-baud UART.
+//! Beside the thermostat sits an Electrical Sensor (`0x0510`) - a *utility* device
+//! type, so the two share an endpoint - reporting the heating element through Power
+//! Topology, Electrical Power Measurement and Electrical Energy Measurement: what
+//! the element draws while the Mill has it on, and how much energy it has drawn
+//! over the device's lifetime.
 //!
-//! **Milestone 1: the heater interface is simulated.** No GPIO drives a relay and no
-//! ADC reads a thermistor; `heater.rs` is the single module real hardware I/O
-//! replaces. Everything else - BLE commissioning, joining a Thread network, SRP
-//! registration, the data model and NVS persistence - is real.
+//! The wire protocol is in `mill.rs` and the UART that carries it in `heater.rs`;
+//! `MILL-HARDWARE-INTERFACE.md` records where every byte of it came from.
 //!
 //! The structure is lifted from `rs-matter-embassy`'s own examples: see
 //! `../rs-matter-embassy/examples/esp/src/bin/light_thread.rs` for the stack wiring
@@ -70,13 +70,14 @@ use rs_matter_embassy::wireless::{EmbassyThread, EmbassyThreadMatterStack};
 
 use tinyrlibc as _;
 
-use crate::heater::SimulatedHeater;
+use crate::heater::MillHeater;
 use crate::meter::{ElecEnergyDeviceLogic, ElecPwrDeviceLogic};
 use crate::thermostat::ThermostatDeviceLogic;
 use crate::vendor_kv::VendorKv;
 
 mod heater;
 mod meter;
+mod mill;
 mod thermostat;
 mod vendor_kv;
 
@@ -153,6 +154,25 @@ async fn main(_s: Spawner) {
         EmbassyThreadMatterStack::init(&DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT),
     );
 
+    // The Mill UART: GPIO16 out to the heater's MCU, GPIO17 back, 9600 8N1 (the rest
+    // of `Config::default()`), no flow control. The pin assignment is inherited
+    // from the ESPHome build that has been driving the deployed unit.
+    //
+    // Note that these are also the ESP32-C6's *default UART0 console* pins, which
+    // is why UART1 carries the Mill and the log console lives on the USB
+    // Serial/JTAG peripheral instead - see the `esp-println` features in
+    // `Cargo.toml`. The ROM bootloader still says its piece on UART0 at reset,
+    // before any of this runs; those bytes do reach the Mill's MCU, framed as
+    // nothing it understands.
+    let mill_uart = esp_hal::uart::Uart::new(
+        peripherals.UART1,
+        esp_hal::uart::Config::default().with_baudrate(mill::BAUD_RATE),
+    )
+    .unwrap()
+    .with_tx(peripherals.GPIO16)
+    .with_rx(peripherals.GPIO17)
+    .into_async();
+
     // The NVS-backed KV store. `get_persistent_store` only needs a small scratch
     // buffer to parse the partition table, so we give it a local one.
     let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
@@ -181,7 +201,7 @@ async fn main(_s: Spawner) {
         // the heater. Loading here rather than later matters: it has to happen before
         // the `Startup` lifecycle op reaches the handlers, because that is where the
         // Thermostat handler validates and repairs what we just loaded.
-        let heater = SimulatedHeater::new(&kv);
+        let heater = MillHeater::new(&kv, mill_uart);
 
         let thermostat_handler = ThermostatHandler::new(
             Dataver::new_rand(&mut weak_rand),
