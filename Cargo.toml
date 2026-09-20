@@ -1,0 +1,98 @@
+[package]
+name = "mill-mod-matter"
+version = "0.1.0"
+edition = "2021"
+description = "Matter-over-Thread thermostat firmware for an ESP32-C6 retrofitted into a Mill Gen 2 panel heater"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "mill-mod-matter"
+path = "src/main.rs"
+# No `libtest` on a bare-metal target.
+harness = false
+
+[dependencies]
+log = "0.4"
+
+# The Matter stack. `rs_matter_embassy::matter` re-exports `rs-matter` itself and
+# `rs_matter_embassy::stack` re-exports `rs-matter-stack`, so this is the only
+# Matter dependency we name.
+#
+# `default-features = false` drops the default `rustcrypto` backend (Thread wants
+# `mbedtls`, which OpenThread already links) and the default `trouble` BLE host,
+# both of which are re-enabled explicitly below.
+#
+# - `esp`                      esp-hal/esp-radio flavoured drivers (`EspThreadDriver`)
+# - `trouble`                  pure-Rust BLE host, for commissioning
+# - `openthread` + `mbedtls`   Thread transport, sharing OpenThread's mbedTLS
+# - `openthread-heap-int-8192` OpenThread's internal heap, shared with mbedTLS
+# - `events-ringbuf-size-64`   MUST be set: the default is `events-ringbuf-size-0`,
+#                              i.e. events are silently never emitted, which would
+#                              mute Electrical Energy Measurement's two events.
+# - `groups`                   the Groups cluster we serve on the thermostat endpoint
+rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-features = false, features = [
+    "esp",
+    "log",
+    "trouble",
+    "openthread",
+    "mbedtls",
+    "openthread-heap-int-8192",
+    "events-ringbuf-size-64",
+    "groups",
+] }
+
+embassy-executor = "0.10"
+embassy-embedded-hal = "0.6"
+embassy-futures = "0.1"
+embassy-time = "0.5"
+embassy-sync = "0.8"
+
+esp-hal = { version = "~1.2", features = ["esp32c6", "log-04", "unstable", "exception-handler"] }
+esp-rtos = { version = "0.4", features = ["esp32c6", "esp-radio", "embassy"] }
+esp-radio = { version = "1.0.0-beta.0", features = ["esp32c6", "ble", "log-04", "unstable"] }
+esp-alloc = { version = "0.11" }
+esp-storage = { version = "0.10", features = ["esp32c6", "embedded-storage"] }
+esp-bootloader-esp-idf = { version = "0.6", features = ["esp32c6", "log-04"] }
+esp-metadata-generated = { version = "0.5", features = ["esp32c6"] }
+esp-println = { version = "0.18", features = ["esp32c6", "log-04"] }
+esp-backtrace = { version = "0.20", features = ["esp32c6", "panic-handler", "println"] }
+
+# The C6 is single-core but `esp-rtos` needs real atomics across its interrupt
+# handlers, so `critical-section` (not `unsafe-assume-single-core`).
+portable-atomic = { version = "1", features = ["critical-section"] }
+static_cell = "2"
+# The mbedTLS and OpenThread C code needs a handful of libc symbols.
+tinyrlibc = { version = "0.5", default-features = false, features = ["memchr", "utoa", "strtoul"] }
+
+[patch.crates-io]
+# The whole point of these two: `rs-matter-embassy` depends on `rs-matter-stack`
+# from crates.io, which in turn depends on `rs-matter` from crates.io - and we need
+# our fork of `rs-matter`, which carries the Thermostat and Electrical Sensor
+# cluster handlers. Version `0.4.1` satisfies the `^0.4` that `rs-matter-stack`
+# asks for, so no version surgery is needed.
+rs-matter = { path = "../rs-matter/rs-matter" }
+rs-matter-stack = { path = "../rs-matter-stack" }
+
+# `rs-matter-embassy` is built against an unreleased `esp-hal`; the whole `esp-*`
+# family has to come from the same git revision or the peripheral singletons do not
+# line up. This rev is the one `rs-matter-embassy/examples/esp/Cargo.toml` pins.
+esp-hal = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+esp-rtos = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+esp-alloc = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+esp-backtrace = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+esp-println = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+esp-radio = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+esp-storage = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+esp-metadata-generated = { git = "https://github.com/esp-rs/esp-hal", rev = "0fed45c84c0723ed4e0b7d19c7f3078ed79090c6" }
+
+[profile.dev]
+# Unoptimised Rust is too slow for the radio stacks' timing requirements.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+opt-level = "s"
+overflow-checks = false

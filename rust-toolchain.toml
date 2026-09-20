@@ -1,0 +1,7 @@
+# `build-std` in `.cargo/config.toml` needs a nightly toolchain and `rust-src`:
+# the `riscv32imac-unknown-none-elf` `core`/`alloc` are built from source so that
+# the `panic_abort` runtime and the size-tuned codegen flags apply to them too.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["riscv32imac-unknown-none-elf"]

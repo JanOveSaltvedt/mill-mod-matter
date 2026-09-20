@@ -1,0 +1,22 @@
+# The ESP32-C6 is RISC-V (`imac`), so the stock nightly toolchain builds it - no
+# `espup`/Xtensa fork needed.
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.'cfg(all(target_arch = "riscv32", target_os = "none"))']
+runner = "espflash flash --monitor"
+# `linkall.x` is `esp-hal`'s linker script. The two `*_backend_soft="compact"` cfgs
+# pick the small (rather than fast) software SHA-2 / AES implementations, which is
+# what keeps the mbedTLS + Matter crypto inside the C6's flash budget.
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers",
+    "--cfg", "sha2_backend_soft=\"compact\"",
+    "--cfg", "aes_backend_soft=\"compact\"",
+]
+
+[unstable]
+build-std = ["core", "alloc", "panic_abort"]
+
+[env]
+ESP_LOG = "info"

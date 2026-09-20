@@ -1,0 +1,465 @@
+//! Matter-over-Thread thermostat firmware for an ESP32-C6 retrofitted into a
+//! Mill Gen 2 panel heater, replacing its WiFi controller.
+//!
+//! Endpoint 1 carries two device types. The Thermostat (`0x0301`, `HEAT`) is backed
+//! by [`SimulatedHeater`]: the local temperature drifts towards the heating setpoint
+//! while `SystemMode` is `Heat`, and back towards ambient otherwise. Beside it sits
+//! an Electrical Sensor (`0x0510`) - a *utility* device type, so the two share an
+//! endpoint - reporting the heating element through Power Topology, Electrical Power
+//! Measurement and Electrical Energy Measurement: what the element draws while the
+//! relay is closed, and how much energy it has drawn over the device's lifetime.
+//!
+//! **Milestone 1: the heater interface is simulated.** No GPIO drives a relay and no
+//! ADC reads a thermistor; `heater.rs` is the single module real hardware I/O
+//! replaces. Everything else - BLE commissioning, joining a Thread network, SRP
+//! registration, the data model and NVS persistence - is real.
+//!
+//! The structure is lifted from `rs-matter-embassy`'s own examples: see
+//! `../rs-matter-embassy/examples/esp/src/bin/light_thread.rs` for the stack wiring
+//! and `light_wifi_persistent.rs` for the NVS store and factory reset.
+#![no_std]
+#![no_main]
+// The handler chain is a deeply nested type; the stack's own examples need this too.
+#![recursion_limit = "256"]
+
+use core::borrow::BorrowMut;
+use core::pin::pin;
+
+use embassy_embedded_hal::adapter::BlockingAsync;
+use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
+
+use esp_alloc::heap_allocator;
+use esp_backtrace as _;
+use esp_bootloader_esp_idf::partitions::{
+    read_partition_table, DataPartitionSubType, PartitionType, PARTITION_TABLE_MAX_LEN,
+};
+use esp_hal::gpio::{Input, InputConfig, Pull};
+use esp_hal::ram;
+use esp_hal::timer::timg::TimerGroup;
+use esp_metadata_generated::memory_range;
+use esp_storage::FlashStorage;
+
+use log::{info, warn};
+
+use rs_matter_embassy::matter::crypto::{default_crypto, Crypto};
+use rs_matter_embassy::matter::dm::clusters::app::elec_energy_meas::{self, ElecEnergyMeasHooks};
+use rs_matter_embassy::matter::dm::clusters::app::elec_pwr_meas::{self, ElecPwrMeasHooks};
+// Aliased: the local `thermostat` module below holds our device logic, and
+// `HandlerAsyncAdaptor` is a name every generated cluster module exports.
+use rs_matter_embassy::matter::dm::clusters::app::power_topology::{self, PowerTopologyHandler};
+use rs_matter_embassy::matter::dm::clusters::app::thermostat::{
+    HandlerAsyncAdaptor as ThermostatHandlerAdaptor, ThermostatHandler, ThermostatHooks,
+};
+use rs_matter_embassy::matter::dm::clusters::basic_info::BasicInfoConfig;
+use rs_matter_embassy::matter::dm::clusters::desc::{self, ClusterHandler as _};
+use rs_matter_embassy::matter::dm::clusters::groups::{self, ClusterHandler as _};
+use rs_matter_embassy::matter::dm::clusters::identify::{self, IdentifyHandler};
+use rs_matter_embassy::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM};
+use rs_matter_embassy::matter::dm::devices::{DEV_TYPE_ELECTRICAL_SENSOR, DEV_TYPE_THERMOSTAT};
+use rs_matter_embassy::matter::dm::endpoints::ROOT_ENDPOINT_ID;
+use rs_matter_embassy::matter::dm::{Async, Dataver, EmptyHandler, Endpoint, Node};
+use rs_matter_embassy::matter::error::Error;
+use rs_matter_embassy::matter::persist::KvBlobStore;
+use rs_matter_embassy::matter::utils::init::InitMaybeUninit;
+use rs_matter_embassy::matter::{clusters, devices};
+use rs_matter_embassy::persist::SeqMapKvBlobStore;
+use rs_matter_embassy::stack::rand::reseeding_csprng;
+use rs_matter_embassy::wireless::esp::EspThreadDriver;
+use rs_matter_embassy::wireless::{EmbassyThread, EmbassyThreadMatterStack};
+
+use tinyrlibc as _;
+
+use crate::heater::SimulatedHeater;
+use crate::meter::{ElecEnergyDeviceLogic, ElecPwrDeviceLogic};
+use crate::thermostat::ThermostatDeviceLogic;
+use crate::vendor_kv::VendorKv;
+
+mod heater;
+mod meter;
+mod thermostat;
+mod vendor_kv;
+
+extern crate alloc;
+
+macro_rules! mk_static {
+    ($t:ty) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        STATIC_CELL.uninit()
+    }};
+}
+
+/// Endpoint 0 (the root endpoint) always runs the hidden Matter system clusters, so
+/// the thermostat gets ID=1.
+const THERMOSTAT_ENDPOINT: u16 = 1;
+
+/// The amount of memory for allocating all `rs-matter-stack` futures created during
+/// the execution of the `run*` methods. This does NOT include the rest of the Matter
+/// stack.
+///
+/// Those futures are allocated with a small bump allocator, which results in a much
+/// lower memory use than letting them sit on the program stack. If this is not
+/// enough, the program panics during stack initialization - raise it until it does
+/// not. 25000 is what `light_thread.rs` uses for non-concurrent commissioning.
+const BUMP_SIZE: usize = 25000;
+
+/// Heap, strictly necessary only for Thread+BLE and for the only Matter dependency
+/// that needs (~4KB) alloc - `x509`.
+const HEAP_SIZE: usize = 100 * 1024;
+
+const RECLAIMED_RAM: usize =
+    memory_range!("DRAM2_UNINIT").end - memory_range!("DRAM2_UNINIT").start;
+
+/// How long the Boot Mode pin has to be held low to factory-reset the device.
+const RESET_SECS: u64 = 3;
+
+esp_bootloader_esp_idf::esp_app_desc!();
+
+#[esp_rtos::main]
+async fn main(_s: Spawner) {
+    esp_println::logger::init_logger_from_env();
+
+    info!("Mill Matter thermostat starting...");
+
+    heap_allocator!(size: HEAP_SIZE - RECLAIMED_RAM);
+    heap_allocator!(#[ram(reclaimed)] size: RECLAIMED_RAM);
+
+    // Necessary `esp-hal` initialization boilerplate
+
+    let peripherals = esp_hal::init(esp_hal::Config::default());
+
+    // Create the crypto provider, using the `esp-hal` TRNG/ADC1 as the source of
+    // randomness for a reseeding CSPRNG.
+    let _trng_source = esp_hal::rng::TrngSource::new(peripherals.RNG, peripherals.ADC1);
+    let crypto = default_crypto(
+        reseeding_csprng(esp_hal::rng::Trng::try_new().unwrap(), 1000).unwrap(),
+        DAC_PRIVKEY,
+    );
+
+    let mut weak_rand = crypto.weak_rand().unwrap();
+
+    // Unlike the `rs-matter-embassy` examples, which randomise this per boot to
+    // dodge stale SRP registrations, we derive a *stable* EUI-64 from the chip's
+    // factory MAC. This device persists its commissioning, so it has to come back
+    // with the same Thread and SRP identity it went down with.
+    let ieee_eui64 = eui64_from_factory_mac();
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+
+    // Allocate the Matter stack statically: its footprint is ~35-50KB, which would
+    // blow the program stack, and the wireless variants require it anyway.
+    let stack = mk_static!(EmbassyThreadMatterStack::<BUMP_SIZE, ()>).init_with(
+        EmbassyThreadMatterStack::init(&DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT),
+    );
+
+    // The NVS-backed KV store. `get_persistent_store` only needs a small scratch
+    // buffer to parse the partition table, so we give it a local one.
+    let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+    let mut store = get_persistent_store(peripherals.FLASH, &mut pt_buf[..]);
+
+    // Re-hydrate the `Matter` instance (fabrics, basic info, RTC) and open the basic
+    // commissioning window if this device has no fabrics yet.
+    stack.startup(&crypto, &mut store).await.unwrap();
+
+    if stack.matter().has_fabrics() {
+        info!(
+            "To factory-reset, press and hold the Boot Mode pin (GPIO9) for {} or more seconds",
+            RESET_SECS
+        );
+    }
+
+    {
+        // `kv` only borrows the store (the blanket `&mut T: KvBlobStore`), so
+        // dropping it at the end of this scope hands the store back for the factory
+        // reset below.
+        let kv = stack.matter().kv(&mut store);
+
+        // The heater, and the three cluster device-logic structs that share it. The
+        // heater and the thermostat logic re-hydrate their persisted state from `kv`
+        // as they are built - the two meters have none of their own, they just read
+        // the heater. Loading here rather than later matters: it has to happen before
+        // the `Startup` lifecycle op reaches the handlers, because that is where the
+        // Thermostat handler validates and repairs what we just loaded.
+        let heater = SimulatedHeater::new(&kv);
+
+        let thermostat_handler = ThermostatHandler::new(
+            Dataver::new_rand(&mut weak_rand),
+            THERMOSTAT_ENDPOINT,
+            ThermostatDeviceLogic::new(&kv, &heater),
+        );
+
+        // The Electrical Sensor clusters. Power Topology carries no state at all -
+        // with the `NODE` topology it has no attributes to serve.
+        let power_handler = elec_pwr_meas::ElecPwrMeasHandler::new(
+            Dataver::new_rand(&mut weak_rand),
+            THERMOSTAT_ENDPOINT,
+            ElecPwrDeviceLogic::new(&heater),
+        );
+
+        let energy_handler = elec_energy_meas::ElecEnergyMeasHandler::new(
+            Dataver::new_rand(&mut weak_rand),
+            THERMOSTAT_ENDPOINT,
+            ElecEnergyDeviceLogic::new(&heater),
+        );
+
+        // Chain our endpoint clusters. The chain is matched last-first.
+        let handler = EmptyHandler
+            // The Endpoint 0 system clusters that are ours to provide. The stack
+            // adds the operational network clusters (Network Commissioning, General
+            // Commissioning, General Diagnostics and Thread Diagnostics) on top,
+            // because only it knows the network driver state - which is why this
+            // must be `root_handler` and NOT `ThreadSysHandlerBuilder`, or those
+            // clusters would be chained twice.
+            .chain(
+                |e, _| e == ROOT_ENDPOINT_ID,
+                Async(EmbassyThreadMatterStack::<0, ()>::root_handler(
+                    &(),
+                    &mut weak_rand,
+                )),
+            )
+            // Every endpoint needs a Descriptor cluster; use the one `rs-matter`
+            // provides out of the box.
+            .chain(
+                |e, c| e == THERMOSTAT_ENDPOINT && c == desc::DescHandler::CLUSTER.id,
+                Async(desc::DescHandler::new(Dataver::new_rand(&mut weak_rand)).adapt()),
+            )
+            .chain(
+                |e, c| e == THERMOSTAT_ENDPOINT && c == identify::CLUSTER.id,
+                Async(IdentifyHandler::new(Dataver::new_rand(&mut weak_rand)).adapt()),
+            )
+            .chain(
+                |e, c| e == THERMOSTAT_ENDPOINT && c == groups::GroupsHandler::CLUSTER.id,
+                Async(groups::GroupsHandler::new(Dataver::new_rand(&mut weak_rand)).adapt()),
+            )
+            .chain(
+                |e, c| e == THERMOSTAT_ENDPOINT && c == ThermostatDeviceLogic::CLUSTER.id,
+                ThermostatHandlerAdaptor(&thermostat_handler),
+            )
+            .chain(
+                |e, c| e == THERMOSTAT_ENDPOINT && c == power_topology::CLUSTER.id,
+                Async(PowerTopologyHandler::new(Dataver::new_rand(&mut weak_rand)).adapt()),
+            )
+            .chain(
+                |e, c| e == THERMOSTAT_ENDPOINT && c == ElecPwrDeviceLogic::CLUSTER.id,
+                Async(elec_pwr_meas::HandlerAdaptor(&power_handler)),
+            )
+            .chain(
+                |e, c| e == THERMOSTAT_ENDPOINT && c == ElecEnergyDeviceLogic::CLUSTER.id,
+                Async(elec_energy_meas::HandlerAdaptor(&energy_handler)),
+            );
+
+        // Run the Matter stack with our handler. `pin!` is optional, but reduces the
+        // size of the final future.
+        //
+        // The three device-logic `run()` loops need no task of their own: the
+        // Interaction Model - which `stack.run` owns - polls `AsyncHandler::run` on
+        // every handler in the chain, and each cluster handler drives its hooks'
+        // `run()` from there. Hence `()` for the user task.
+        let mut matter = pin!(stack.run(
+            // The Matter stack needs to instantiate an `openthread` Radio
+            EmbassyThread::new(
+                EspThreadDriver::new(peripherals.IEEE802154, peripherals.BT),
+                crypto.rand().unwrap(),
+                ieee_eui64,
+                &kv,
+                stack,
+                true, // Use a random BLE address
+            ),
+            // The crypto provider
+            &crypto,
+            // Our `AsyncHandler` + `AsyncMetadata` impl
+            (NODE, &handler),
+            // The blob store the stack persists its state to
+            &kv,
+            // No user task to run
+            (),
+        ));
+
+        // Run Matter, and also watch for a factory-reset request
+        let mut wait_reset = pin!(wait_pin_low(Input::new(
+            peripherals.GPIO9,
+            InputConfig::default().with_pull(Pull::Down)
+        )));
+
+        // Which future finished decides what happens next, so `select` is matched
+        // rather than `coalesce`d: `stack.run` can in principle return `Ok(())` when
+        // the stack is stopped, and treating that as consent to wipe a commissioned
+        // device - as the upstream example's `coalesce().unwrap()` would - is not a
+        // trade anybody wants.
+        match select(&mut matter, &mut wait_reset).await {
+            Either::First(result) => {
+                result.unwrap();
+
+                warn!("Matter stack stopped; rebooting without touching storage");
+
+                esp_hal::system::software_reset()
+            }
+            Either::Second(result) => result.unwrap(),
+        }
+
+        warn!("Factory reset requested");
+
+        // Clear our own two blobs while we still hold the store handle the device
+        // logic was built over.
+        //
+        // This cannot ride on the `FactoryReset` lifecycle op: the EP1 cluster
+        // handlers delegate persistence to their hooks, and `ThermostatHooks` /
+        // `ElecEnergyMeasHooks` have no lifecycle method of their own. Nor does
+        // `Matter::factory_reset` do it - that only removes rs-matter's own keys,
+        // which by design grow *downwards* from `VENDOR_KEYS_START`. So this is the
+        // one place the setpoints and the lifetime energy counter get cleared.
+        for key in [
+            vendor_kv::THERMOSTAT_STATE_KEY,
+            vendor_kv::HEATING_ELEMENT_ENERGY_KEY,
+        ] {
+            if let Err(e) = kv.remove_blob(key) {
+                warn!("Could not remove vendor key {key:#x}: {e}");
+            }
+        }
+    }
+
+    // `stack.reset` takes `&mut *stack`, so it cannot be called while `kv` - which
+    // borrows `stack.matter()` - is alive. Hence the scope above, and hence a
+    // freshly-built handler here: the EP1 chain borrows `kv` and cannot outlive it.
+    //
+    // Leaving EP1 out of this chain is sound because the only thing `reset`
+    // does with a handler is broadcast the `FactoryReset` lifecycle op, and the
+    // handlers that persist anything through it - ACL, NOC, Group Key Management,
+    // General Commissioning - all live inside `root_handler`. Our EP1 state was
+    // already removed above. Chain EP1 back in here if one of its clusters ever
+    // grows `FactoryReset`-driven persistence.
+    warn!("Resetting storage");
+
+    let reset_handler = EmptyHandler.chain(
+        |e, _| e == ROOT_ENDPOINT_ID,
+        Async(EmbassyThreadMatterStack::<0, ()>::root_handler(
+            &(),
+            &mut weak_rand,
+        )),
+    );
+
+    stack
+        .reset(&crypto, (NODE, &reset_handler), &mut store)
+        .await
+        .unwrap();
+
+    warn!("Rebooting...");
+
+    esp_hal::system::software_reset()
+}
+
+/// Basic info about our device.
+///
+/// The attestation data is still `rs-matter`'s test DAC/PAI, so a commissioner will
+/// warn that the device is uncertified - expected, and harmless for a private
+/// fabric. The vendor and product IDs are the CSA *test* ones for the same reason.
+const DEV_DET: BasicInfoConfig = BasicInfoConfig {
+    vendor_name: "Mill Mod",
+    product_name: "Mill Gen 2 Thermostat",
+    // The mDNS-to-SRP bridge wants this: how long, in ms, a sleepy device may take
+    // to answer. Same value the `rs-matter-embassy` Thread example uses.
+    sai: Some(500),
+    ..rs_matter_embassy::matter::dm::devices::test::TEST_DEV_DET
+};
+
+/// The Node meta-data describing our Matter device.
+///
+/// EP1 carries two device types: the Thermostat, which is an *application* device
+/// type, and the Electrical Sensor, which is a *utility* one. Core spec 9.2.1 allows
+/// a simple endpoint only one application device type but any number of utility
+/// ones, which is what lets the thermostat meter itself on the same endpoint rather
+/// than needing a second.
+const NODE: Node = Node {
+    endpoints: &[
+        EmbassyThreadMatterStack::<0, ()>::root_endpoint(),
+        Endpoint::new(
+            THERMOSTAT_ENDPOINT,
+            devices!(DEV_TYPE_THERMOSTAT, DEV_TYPE_ELECTRICAL_SENSOR),
+            clusters!(
+                desc::DescHandler::CLUSTER,
+                identify::CLUSTER,
+                groups::GroupsHandler::CLUSTER,
+                ThermostatDeviceLogic::CLUSTER,
+                power_topology::CLUSTER,
+                ElecPwrDeviceLogic::CLUSTER,
+                ElecEnergyDeviceLogic::CLUSTER,
+            ),
+        ),
+    ],
+};
+
+/// Derive a stable IEEE 802.15.4 extended address from the chip's factory MAC-48.
+///
+/// The standard EUI-48 -> EUI-64 encapsulation: keep the three OUI bytes, insert
+/// `FF FE`, then the three device bytes. The U/L bit is deliberately *not* flipped -
+/// that is the "modified EUI-64" form IPv6 uses for interface identifiers, and
+/// setting it here would mark an address that came out of Espressif's own OUI as
+/// locally administered, which it is not.
+///
+/// `esp-hal` exposes no 802.15.4 interface MAC (only Station / AccessPoint /
+/// Bluetooth), so the base MAC is the route. The BLE address is randomised
+/// separately, so there is nothing to collide with.
+fn eui64_from_factory_mac() -> [u8; 8] {
+    let mac = esp_hal::efuse::base_mac_address();
+    let mac = mac.as_bytes();
+
+    [mac[0], mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]]
+}
+
+/// Build the KV store over the `nvs` data partition of the flashed partition table.
+///
+/// The partition is located by *type* at runtime, so resizing it in `partitions.csv`
+/// needs no code change.
+fn get_persistent_store<'d>(
+    flash: esp_hal::peripherals::FLASH<'d>,
+    mut buf: impl BorrowMut<[u8]>,
+) -> impl KvBlobStore + 'd {
+    let mut flash = FlashStorage::new(flash);
+    let pt_buf = &mut buf.borrow_mut()[..PARTITION_TABLE_MAX_LEN];
+    let pt = read_partition_table(&mut flash, pt_buf).unwrap();
+    let nvs = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Nvs))
+        .unwrap()
+        .unwrap();
+
+    let start = nvs.offset();
+    let end = nvs.offset() + nvs.len();
+    info!(
+        "Will use NVS partition \"{}\" at {:#x}..{:#x}",
+        nvs.label_as_str(),
+        start,
+        end
+    );
+
+    SeqMapKvBlobStore::new(BlockingAsync::new(flash), start..end)
+}
+
+/// Resolve once the pin has been held low for [`RESET_SECS`].
+async fn wait_pin_low(mut pin: Input<'_>) -> Result<(), Error> {
+    loop {
+        pin.wait_for_low().await;
+
+        // Debounce
+        embassy_time::Timer::after_millis(50).await;
+
+        if pin.is_low() {
+            warn!(
+                "Detected Boot Mode pin low, keep it low for {} more seconds to reset the storage",
+                RESET_SECS
+            );
+
+            let result = select(
+                pin.wait_for_high(),
+                embassy_time::Timer::after_secs(RESET_SECS),
+            )
+            .await;
+
+            if matches!(result, Either::Second(())) {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
