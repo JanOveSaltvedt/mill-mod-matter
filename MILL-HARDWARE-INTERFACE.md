@@ -386,7 +386,8 @@ The current API is roughly right in *shape*; the semantics of two methods invert
 | `room_temperature() -> i16` | status byte 7 × 100; must be **nullable** until the first frame arrives |
 | `tick_room() -> bool` | **gone.** Replaced by "a status frame arrived and byte 7 changed" |
 | `active_power_mw()` | `600_000` when `heating()`, else 0. Keep `ELEMENT_POWER_MW`, change the value |
-| `active_current_ma()`, `energy_mwh()`, `close_period()`, `integrate()`, KV persistence | **keep as is.** They only depend on `active_power_mw()`, which still works |
+| `active_current_ma()` | **gone**, along with the nominal supply constants. It was the plate rating divided by a 230 V that is never measured; see `meter.rs` for why no such reading is served |
+| `energy_mwh()`, `close_period()`, `integrate()`, KV persistence | **keep as is.** They only depend on `active_power_mw()`, which still works |
 | `reset_at_boot()`, `last_period()` | unchanged |
 
 New state the type has to hold: the Mill's reported setpoint (byte 6) and reported

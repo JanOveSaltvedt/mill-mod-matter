@@ -9,7 +9,9 @@
 //! type, so the two share an endpoint - reporting the heating element through Power
 //! Topology, Electrical Power Measurement and Electrical Energy Measurement: what
 //! the element draws while the Mill has it on, and how much energy it has drawn
-//! over the device's lifetime.
+//! over the device's lifetime. There is no metering hardware behind either, only
+//! the element's plate rating and the on/off bit the Mill reports, which is why
+//! `meter.rs` serves `ActivePower` and the energy totals and nothing else.
 //!
 //! The wire protocol is in `mill.rs` and the UART that carries it in `heater.rs`;
 //! `MILL-HARDWARE-INTERFACE.md` records where every byte of it came from.

@@ -76,17 +76,6 @@ pub const STATUS_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_
 /// thing worth confirming before believing the energy figures.
 pub const ELEMENT_POWER_MW: i64 = 600_000;
 
-/// The nominal supply voltage, in millivolts.
-pub const SUPPLY_VOLTAGE_MV: i64 = 230_000;
-
-/// The nominal supply frequency, in millihertz.
-pub const SUPPLY_FREQUENCY_MHZ: i64 = 50_000;
-
-/// A purely resistive load draws all of its current in phase with the supply, so
-/// its power factor is unity - 100.00%, in the hundredths of a percent
-/// `PowerFactor` is expressed in.
-pub const UNITY_POWER_FACTOR: i64 = 10_000;
-
 /// How many bytes are taken off the UART at a time. One frame's worth, near
 /// enough; the decoder is fed byte by byte regardless.
 const RX_CHUNK: usize = 32;
@@ -373,13 +362,6 @@ impl<'a> MillHeater<'a> {
         } else {
             0
         }
-    }
-
-    /// The current drawn right now, in milliamps, derived from the power and the
-    /// nominal supply voltage so that the three reported readings stay consistent
-    /// with one another.
-    pub fn active_current_ma(&self) -> i64 {
-        self.active_power_mw() * 1000 / SUPPLY_VOLTAGE_MV
     }
 
     /// The energy drawn over the device's lifetime, in milliwatt-hours.

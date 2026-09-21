@@ -109,6 +109,12 @@ otherwise — the element's plate rating gated on one bit of the status frame. T
 is no metering hardware in the heater and none was added, so that rating is worth
 confirming against the unit being modded.
 
+For the same reason it is the *only* power reading served: no voltage, current,
+frequency, power factor or RMS, apparent and reactive quantities. Those are all
+optional in the cluster, and serving them would mean deriving them from a nominal
+230 V / 50 Hz supply that this board never measures — a client has no way to tell
+such a reading from a measured one.
+
 ## Persistence and factory reset
 
 State lives in the `nvs` flash partition: the Matter fabrics and Thread credentials,

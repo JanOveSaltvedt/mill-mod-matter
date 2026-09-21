@@ -1,12 +1,20 @@
 //! The Electrical Sensor device type's device-specific half: what the heater's
 //! heating element is drawing right now, and what it has drawn over its lifetime.
 //!
-//! There is no metering hardware. The Mill reports whether its element is on and
-//! nothing more, so every reading here is the element's plate rating gated on
-//! that one bit, and the rest is derived from the nominal supply - which is the
-//! whole reason the spec keeps the RMS and apparent quantities as separate
-//! readings rather than deriving them. A current-sense chip would replace the
-//! derivations in [`MillHeater`] and leave this module alone.
+//! There is no metering hardware of any kind. The Mill reports whether its
+//! element is on and nothing more, so the one reading served here is the
+//! element's plate rating gated on that single bit. Nothing else is served:
+//! voltage, current, frequency, power factor and the RMS, apparent and reactive
+//! quantities would all have to be *derived* from a nominal supply this board
+//! never measures, and a client cannot tell a derived reading from a measured
+//! one - it would just see a meter claiming 230 V and 2.6 A that is in truth
+//! reporting one bit. `ActivePower` is mandatory and honest about what it is;
+//! the optional readings would not be.
+//!
+//! A current-sense chip is what would change this. It would replace
+//! [`MillHeater::active_power_mw`] with a real measurement and could then earn
+//! the optional readings back, one served attribute per quantity it actually
+//! reads.
 
 use core::cell::Cell;
 
@@ -24,19 +32,13 @@ use rs_matter_embassy::matter::dm::Cluster;
 use rs_matter_embassy::matter::tlv::Nullable;
 use rs_matter_embassy::matter::with;
 
-use crate::heater::{
-    MillHeater, ENERGY_PERIOD, METER_TICK, SUPPLY_FREQUENCY_MHZ, SUPPLY_VOLTAGE_MV,
-    UNITY_POWER_FACTOR,
-};
+use crate::heater::{MillHeater, ENERGY_PERIOD, METER_TICK};
 
-/// The top of the metering hardware's measurable range, in milliamps.
-const MAX_CURRENT_MA: i64 = 16_000;
-
-/// The top of the metering hardware's measurable range, in milliwatts.
+/// The top of the power reading's range, in milliwatts.
+///
+/// A 16 A single-phase circuit at 230 V, which is the most the element could
+/// draw whatever it turns out to be rated at.
 const MAX_POWER_MW: i64 = 3_680_000;
-
-/// The top of the metering hardware's measurable range, in millivolts.
-const MAX_VOLTAGE_MV: i64 = 400_000;
 
 /// The top of the lifetime energy counter's range, in milliwatt-hours.
 ///
@@ -45,20 +47,20 @@ const MAX_VOLTAGE_MV: i64 = 400_000;
 /// claim a range the counter cannot reach.
 const MAX_ENERGY_MWH: i64 = i64::MAX / 3600;
 
-/// The top of the `Frequency` and `PowerFactor` ranges, which the spec fixes rather
-/// than the hardware.
-const MAX_FREQUENCY_MHZ: i64 = 1_000_000;
-const MAX_POWER_FACTOR: i64 = 10_000;
-
-/// How accurate the meter claims to be, in hundredths of a percent.
+/// How accurate the readings claim to be, in hundredths of a percent.
+///
+/// Not a meter's datasheet figure, because there is no meter: everything served
+/// is the element's plate rating gated on the on/off bit, so this is a claim
+/// about how close that rating is to the truth - manufacturing tolerance, and a
+/// supply that is only nominally 230 V.
 const METER_ACCURACY: u16 = 500;
 
 /// One `Accuracy` entry: a quantity the meter reads across `0..=$max`, at
 /// [`METER_ACCURACY`] throughout that range.
 ///
 /// Section 2.13.6.3's list is what tells a client which quantities the meter
-/// actually measures, so it has to carry an entry for every reading served - which
-/// is why it is as long as it is.
+/// actually measures, so it carries one entry per reading served - which, here,
+/// is one.
 macro_rules! meter_accuracy {
     ($type:ident, $max:expr) => {
         MeasurementAccuracy::new(
@@ -88,97 +90,25 @@ impl<'a> ElecPwrDeviceLogic<'a> {
 }
 
 impl ElecPwrMeasHooks for ElecPwrDeviceLogic<'_> {
-    /// A single-phase AC load: the `AC` feature, the four mandatory attributes and
-    /// the optional readings that make the power figure checkable.
+    /// A single-phase AC load, with the four mandatory attributes and nothing
+    /// else. The `AC` feature is not a claim to measure anything - one of `AC`
+    /// and `DC` has to be selected and `PowerMode` has to agree with it (section
+    /// 2.13.5) - but it does gate nine of the optional readings, none of which
+    /// this device is in any position to serve.
     const CLUSTER: Cluster<'static> = elec_pwr_meas::FULL_CLUSTER
         .with_revision(3)
         .with_features(elec_pwr_meas::Feature::ALTERNATING_CURRENT.bits())
-        .with_attrs(with!(
-            required;
-            elec_pwr_meas::AttributeId::Voltage
-                | elec_pwr_meas::AttributeId::ActiveCurrent
-                | elec_pwr_meas::AttributeId::ReactiveCurrent
-                | elec_pwr_meas::AttributeId::ApparentCurrent
-                | elec_pwr_meas::AttributeId::ReactivePower
-                | elec_pwr_meas::AttributeId::ApparentPower
-                | elec_pwr_meas::AttributeId::RMSVoltage
-                | elec_pwr_meas::AttributeId::RMSCurrent
-                | elec_pwr_meas::AttributeId::RMSPower
-                | elec_pwr_meas::AttributeId::Frequency
-                | elec_pwr_meas::AttributeId::PowerFactor
-        ))
+        .with_attrs(with!(required))
         .with_cmds(with!())
         .with_events(with!());
 
     const POWER_MODE: PowerModeEnum = PowerModeEnum::AC;
 
-    /// One entry per reading served. A real device would quote its meter's
-    /// datasheet here.
-    const ACCURACY: &'static [MeasurementAccuracy] = &[
-        meter_accuracy!(Voltage, MAX_VOLTAGE_MV),
-        meter_accuracy!(RMSVoltage, MAX_VOLTAGE_MV),
-        meter_accuracy!(ActiveCurrent, MAX_CURRENT_MA),
-        meter_accuracy!(ReactiveCurrent, MAX_CURRENT_MA),
-        meter_accuracy!(ApparentCurrent, MAX_CURRENT_MA),
-        meter_accuracy!(RMSCurrent, MAX_CURRENT_MA),
-        meter_accuracy!(ActivePower, MAX_POWER_MW),
-        meter_accuracy!(ReactivePower, MAX_POWER_MW),
-        meter_accuracy!(ApparentPower, MAX_POWER_MW),
-        meter_accuracy!(RMSPower, MAX_POWER_MW),
-        meter_accuracy!(Frequency, MAX_FREQUENCY_MHZ),
-        meter_accuracy!(PowerFactor, MAX_POWER_FACTOR),
-    ];
+    /// One entry, for the one reading served.
+    const ACCURACY: &'static [MeasurementAccuracy] = &[meter_accuracy!(ActivePower, MAX_POWER_MW)];
 
     fn active_power(&self) -> Nullable<i64> {
         Nullable::some(self.heater.active_power_mw())
-    }
-
-    fn voltage(&self) -> Nullable<i64> {
-        Nullable::some(SUPPLY_VOLTAGE_MV)
-    }
-
-    fn active_current(&self) -> Nullable<i64> {
-        Nullable::some(self.heater.active_current_ma())
-    }
-
-    // A resistive element on a sinusoidal supply draws all of its current in phase:
-    // the RMS readings are the readings, the apparent quantities equal the active
-    // ones, and nothing is reactive.
-
-    fn rms_voltage(&self) -> Nullable<i64> {
-        Nullable::some(SUPPLY_VOLTAGE_MV)
-    }
-
-    fn rms_current(&self) -> Nullable<i64> {
-        Nullable::some(self.heater.active_current_ma())
-    }
-
-    fn rms_power(&self) -> Nullable<i64> {
-        Nullable::some(self.heater.active_power_mw())
-    }
-
-    fn apparent_current(&self) -> Nullable<i64> {
-        Nullable::some(self.heater.active_current_ma())
-    }
-
-    fn apparent_power(&self) -> Nullable<i64> {
-        Nullable::some(self.heater.active_power_mw())
-    }
-
-    fn reactive_current(&self) -> Nullable<i64> {
-        Nullable::some(0)
-    }
-
-    fn reactive_power(&self) -> Nullable<i64> {
-        Nullable::some(0)
-    }
-
-    fn frequency(&self) -> Nullable<i64> {
-        Nullable::some(SUPPLY_FREQUENCY_MHZ)
-    }
-
-    fn power_factor(&self) -> Nullable<i64> {
-        Nullable::some(UNITY_POWER_FACTOR)
     }
 
     async fn run<F: Fn(elec_pwr_meas::OutOfBandMessage)>(&self, notify: F) {
@@ -193,9 +123,7 @@ impl ElecPwrMeasHooks for ElecPwrDeviceLogic<'_> {
             if power != self.reported_power_mw.get() {
                 self.reported_power_mw.set(power);
 
-                // Every served reading is derived from the same element state, so
-                // they all move together.
-                notify(elec_pwr_meas::OutOfBandMessage::Update);
+                notify(elec_pwr_meas::OutOfBandMessage::ActivePower);
             }
         }
     }
