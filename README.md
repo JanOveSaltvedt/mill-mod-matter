@@ -46,15 +46,39 @@ makes nothing of them.
 ## Prerequisites
 
 - An ESP32-C6 board (4 MB flash — see `partitions.csv` for other sizes).
-- The three sibling checkouts this crate patches in: `../rs-matter` (on branch
-  `feature/thermostat-energy-metering`), `../rs-matter-stack`, `../rs-matter-embassy`.
 - A Matter controller **with a Thread border router**: Home Assistant with the Matter
   integration and a border router on the network, or a hub that is both at once - Apple
   TV/HomePod, a screen-equipped Google Nest, Echo Hub, SmartThings hub, IKEA Dirigera.
 - `cargo install espflash`
 
 The toolchain (nightly + `rust-src` + the RISC-V target) is pinned by
-`rust-toolchain.toml` and installs itself on first build.
+`rust-toolchain.toml` and installs itself on first build. Everything else, including
+the Matter stack, comes from `Cargo.toml`; nothing has to be checked out beside this
+repository.
+
+### The Matter stack, and the fork
+
+`Cargo.toml` pins all three Matter crates to exact commits, so the build is
+reproducible and needs no sibling checkouts:
+
+| | |
+| --- | --- |
+| [`rs-matter`](https://github.com/JanOveSaltvedt/rs-matter) | **A fork**, branch `feature/thermostat-energy-metering`. It carries what this firmware is built on: the Thermostat, Electrical Power/Energy Measurement and Power Topology cluster handlers. A PR to [`project-chip/rs-matter`](https://github.com/project-chip/rs-matter) is open; when it lands, these entries move back to the upstream repository and nothing else here changes. |
+| [`rs-matter-stack`](https://github.com/ivmarkov/rs-matter-stack) | Unmodified upstream. |
+| [`rs-matter-embassy`](https://github.com/ivmarkov/rs-matter-embassy) | Unmodified upstream. |
+
+`rs-matter` and `rs-matter-stack` sit in `[patch.crates-io]` rather than in
+`[dependencies]`, since nothing here names either of them directly: `rs-matter-embassy`
+resolves both from crates.io, and the patch is what puts the fork underneath it.
+Pinning commits rather than released versions keeps the dependency graph identical to
+the one this was built and tested against.
+
+Each of the three has a commented-out `path = "../..."` line beside it in
+`Cargo.toml`. Uncommenting those (and commenting out the `git` lines) builds against
+sibling checkouts in the same parent directory instead, which is how the fork itself
+is developed. The `esp-*` crates are pinned the same way, to the single git revision
+`rs-matter-embassy`'s own examples use — they must all come from one revision or the
+peripheral singletons stop matching.
 
 ## Configuration
 
@@ -233,9 +257,10 @@ from your controller as well, or it will keep trying to reach the old fabric.
 `src/mill.rs` is the protocol reference: the framing, the status frame's offsets and
 the two command frames, with worked examples asserted at compile time.
 
-`CLAUDE.md` carries the working notes: the four-repository layout and why the
-`[patch.crates-io]` entries exist, where each part of `main.rs` was ported from, and a
-list of non-obvious gotchas in this corner of the Matter stack.
+`CLAUDE.md` carries the working notes: the sibling-checkout layout the fork is
+developed in and why the `[patch.crates-io]` entries exist, where each part of
+`main.rs` was ported from, and a list of non-obvious gotchas in this corner of the
+Matter stack.
 
 ## Licence
 

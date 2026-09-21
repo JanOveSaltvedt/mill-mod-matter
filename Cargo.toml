@@ -27,7 +27,11 @@ harness = false
 [build-dependencies]
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
-rs-matter = { path = "../rs-matter/rs-matter", default-features = false }
+#
+# Our fork, pinned to the exact commit the firmware links (see `[patch.crates-io]`
+# below). Uncomment the `path` line instead to develop against the sibling checkout.
+rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c22fbe4a2fdc9a51c714281000f21f4224e82702", default-features = false }
+# rs-matter = { path = "../rs-matter/rs-matter", default-features = false }
 
 [dependencies]
 log = "0.4"
@@ -60,7 +64,11 @@ log = "0.4"
 #                              uptime. 256 buys headroom in all three rings for 576
 #                              bytes of static RAM.
 # - `groups`                   the Groups cluster we serve on the thermostat endpoint
-rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-features = false, features = [
+#
+# Unmodified upstream, pinned to a commit. To develop against the sibling checkout,
+# swap the next two lines; the feature list below is shared either way.
+# rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-features = false, features = [
+rs-matter-embassy = { git = "https://github.com/ivmarkov/rs-matter-embassy", rev = "ecc674f7bacf81dded484b96123a31e59cd44cf8", default-features = false, features = [
     "esp",
     "log",
     "trouble",
@@ -111,8 +119,16 @@ tinyrlibc = { version = "0.5", default-features = false, features = ["memchr", "
 # our fork of `rs-matter`, which carries the Thermostat and Electrical Sensor
 # cluster handlers. Version `0.4.1` satisfies the `^0.4` that `rs-matter-stack`
 # asks for, so no version surgery is needed.
-rs-matter = { path = "../rs-matter/rs-matter" }
-rs-matter-stack = { path = "../rs-matter-stack" }
+#
+# Both are pinned to a commit rather than a branch, so a checkout builds the same
+# graph a year from now. `rs-matter` is our fork and stays one until the PR adding
+# those handlers lands upstream; `rs-matter-stack` is unmodified upstream, pinned to
+# the commit this was developed against. Swap in the `path` lines to develop against
+# the sibling checkouts - `../rs-matter-embassy` has a matching pair above.
+rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c22fbe4a2fdc9a51c714281000f21f4224e82702" }
+rs-matter-stack = { git = "https://github.com/ivmarkov/rs-matter-stack", rev = "f3aa6091bd080e114a9d8e4e1a432e7b27365403" }
+# rs-matter = { path = "../rs-matter/rs-matter" }
+# rs-matter-stack = { path = "../rs-matter-stack" }
 
 # `rs-matter-embassy` is built against an unreleased `esp-hal`; the whole `esp-*`
 # family has to come from the same git revision or the peripheral singletons do not
