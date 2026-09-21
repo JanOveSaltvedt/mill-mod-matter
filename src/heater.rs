@@ -39,6 +39,22 @@ pub const ENERGY_PERIOD: embassy_time::Duration = embassy_time::Duration::from_s
 /// `ActivePower`.
 pub const METER_TICK: embassy_time::Duration = embassy_time::Duration::from_secs(1);
 
+/// How often the lifetime energy counter may reach flash.
+///
+/// Not a reporting cadence - `CumulativeEnergyImported` is served from RAM, and
+/// re-reported at [`ENERGY_PERIOD`] like everything else. This is a ceiling on
+/// how often the *blocking* write underneath it is allowed to stop the executor,
+/// and the reason for it is in `persist_energy`.
+const ENERGY_PERSIST_INTERVAL: embassy_time::Duration = embassy_time::Duration::from_secs(600);
+
+/// How long a flash write may take before it is worth more than a `debug` line.
+///
+/// There is no hard number to be had here; it is a judgement about what the radio
+/// can absorb. A Thread child that stops servicing its radio for much longer than
+/// this starts missing the MAC acknowledgements and MRP deadlines its parent and
+/// its controller are keeping time against.
+const SLOW_WRITE_MS: u64 = 20;
+
 /// How long the Mill may stay silent before everything it told us is treated as
 /// stale.
 ///
@@ -186,6 +202,12 @@ pub struct MillHeater<'a> {
     /// The lifetime figure in milliwatt-hours as last reported, so a closing
     /// period can say whether `CumulativeEnergyImported` actually moved.
     reported_mwh: Cell<i64>,
+    /// The lifetime figure as it stands *in flash*, and when it was put there in
+    /// milliseconds since boot. Between them they are the whole write policy: a
+    /// counter that has not moved is not rewritten, and one that has waits out
+    /// [`ENERGY_PERSIST_INTERVAL`] first.
+    persisted_mws: Cell<i64>,
+    persisted_ms: Cell<u64>,
     /// Whether the counter started this boot at zero because there was nothing to
     /// restore - which, for a counter living in the Matter KV store, is what a
     /// factory reset leaves behind.
@@ -225,6 +247,8 @@ impl<'a> MillHeater<'a> {
             period: Cell::new(None),
             energy_mws: Cell::new(energy_mws),
             reported_mwh: Cell::new(energy_mws / 3600),
+            persisted_mws: Cell::new(energy_mws),
+            persisted_ms: Cell::new(now),
             reset_at_boot,
             kv,
         }
@@ -383,6 +407,9 @@ impl<'a> MillHeater<'a> {
     pub fn close_period(&self) -> Accumulated {
         self.integrate();
 
+        // On a clock of its own, and a far slower one than this tick.
+        self.persist_energy();
+
         let end = embassy_time::Instant::now().as_millis();
         let start = self.period_start_ms.replace(end);
         let drawn_mws = self.period_mws.replace(0);
@@ -398,16 +425,6 @@ impl<'a> MillHeater<'a> {
         self.period.set(Some((drawn_mws / 3600, start, end)));
 
         let reported = self.reported_mwh.replace(self.energy_mwh());
-
-        // Only on a period that drew something, so an idle device does not rewrite
-        // flash every tick - NOR flash has a write budget, and this one is shared
-        // with the Matter state.
-        if let Err(e) = self.kv.store_blob(
-            HEATING_ELEMENT_ENERGY_KEY,
-            &self.energy_mws.get().to_le_bytes(),
-        ) {
-            error!("Heater: could not persist the energy counter: {e}");
-        }
 
         Accumulated {
             cumulative: self.energy_mwh() != reported,
@@ -559,6 +576,64 @@ impl<'a> MillHeater<'a> {
                 .room_c
                 .is_some_and(|c| self.room_c.replace(Some(c)) != Some(c)),
             element,
+        }
+    }
+
+    /// Write the lifetime energy counter to flash, if the write policy says it is
+    /// time.
+    ///
+    /// The write is blocking the whole way down: `SeqMapKvBlobStore` is an
+    /// `embassy_futures::block_on` around `sequential-storage`, over an
+    /// `esp-storage` `FlashStorage` that takes a critical section - cache off,
+    /// interrupts off - for every flash operation underneath it. This firmware is
+    /// one executor task, so for as long as a write runs, the OpenThread radio
+    /// future, its alarms and the Mill UART are all stopped.
+    ///
+    /// Hence the rate limit. This used to write on every period that drew
+    /// anything, which for an element that stays on is a write every
+    /// [`ENERGY_PERIOD`]: some 17 000 a day into an NVS partition whose erase
+    /// budget is shared with the whole Matter state, and 17 000 stalls a day in a
+    /// radio stack that has a parent to answer to. The cost of the other side of
+    /// the trade is that an unclean power-off now loses up to
+    /// [`ENERGY_PERSIST_INTERVAL`] of accumulated energy - for a lifetime total,
+    /// much the cheaper of the two.
+    fn persist_energy(&self) {
+        let started = embassy_time::Instant::now().as_millis();
+        let energy_mws = self.energy_mws.get();
+
+        let due = energy_mws != self.persisted_mws.get()
+            && started.saturating_sub(self.persisted_ms.get())
+                >= ENERGY_PERSIST_INTERVAL.as_millis();
+
+        if !due {
+            return;
+        }
+
+        let result = self
+            .kv
+            .store_blob(HEATING_ELEMENT_ENERGY_KEY, &energy_mws.to_le_bytes());
+
+        let took_ms = embassy_time::Instant::now()
+            .as_millis()
+            .saturating_sub(started);
+
+        // Unconditionally, a failure included: a store that cannot be made to work
+        // must not become a retry on every tick, which is the exact cadence this
+        // function exists to avoid.
+        self.persisted_ms.set(started);
+
+        match result {
+            Ok(()) => self.persisted_mws.set(energy_mws),
+            Err(e) => error!("Heater: could not persist the energy counter: {e}"),
+        }
+
+        if took_ms >= SLOW_WRITE_MS {
+            warn!(
+                "Heater: persisting the energy counter took {took_ms} ms, \
+                 and the radio and the Mill UART were stopped for all of it"
+            );
+        } else {
+            debug!("Heater: energy counter persisted in {took_ms} ms");
         }
     }
 

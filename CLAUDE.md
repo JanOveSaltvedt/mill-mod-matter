@@ -156,6 +156,14 @@ Each of these cost real investigation. None is obvious from the code.
   the `FactoryReset` lifecycle op does not reach the hooks - `ThermostatHooks` and
   `ElecEnergyMeasHooks` have no lifecycle method. `main.rs` removes the two vendor
   blobs explicitly; see the comment there before adding a third.
+- **A KV write blocks the entire stack.** `SeqMapKvBlobStore` is an
+  `embassy_futures::block_on` around `sequential-storage`, over an `esp-storage`
+  `FlashStorage` that takes a critical section - cache off, interrupts off - for
+  every flash operation under it. There is one executor task, so each
+  `store_blob` stops the OpenThread radio future, its alarms and the Mill UART for
+  as long as the write runs. Persist on an event or a slow timer, never on a
+  per-sample tick: `heater.rs`'s `persist_energy` is the pattern and
+  `ENERGY_PERSIST_INTERVAL` the ceiling.
 - **`stack.reset` takes `&mut *stack`**, so it cannot be called while a `kv` from
   `stack.matter().kv(..)` is alive - and our EP1 handlers borrow that `kv`. Hence the
   scope in `main` and the separate, root-only handler built for the reset call.
