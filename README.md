@@ -67,11 +67,14 @@ The toolchain (nightly + `rust-src` + the RISC-V target) is pinned by
 ```sh
 cargo build --release
 
-espflash flash --monitor --partition-table partitions.csv --baud 1500000 \
+espflash flash --monitor \
     target/riscv32imac-unknown-none-elf/release/mill-mod-matter
 ```
 
-`cargo run --release` does the same, via the runner in `.cargo/config.toml`.
+`cargo run --release` does the same, via the runner in `.cargo/config.toml`. The
+partition table and the flashing baud rate come from `espflash.toml`, so run espflash
+from the project root - a board flashed with espflash's own default table gets a 24 KiB
+`nvs` instead of 64 KiB and comes up with a silently truncated store.
 
 ## Commissioning
 
