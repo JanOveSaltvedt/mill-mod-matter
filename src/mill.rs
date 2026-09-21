@@ -6,13 +6,12 @@
 //! no peripherals, no device state beyond the receive [`Decoder`]'s own byte
 //! buffer. The hardware half lives in [`crate::heater`].
 //!
-//! Reverse-engineered from the ESPHome `mill_panelheater_gen2` component that has
-//! been driving the deployed unit; `MILL-HARDWARE-INTERFACE.md` records where each
-//! constant came from, down to the file and line. The known defects of that
-//! implementation are deliberately *not* reproduced here - in particular this
-//! decoder frames on `0x5B` alone (ESPHome also breaks on `0x0A`, which truncates
-//! any frame carrying a temperature of exactly 10 degC) and it verifies the
-//! checksum it is handed, which ESPHome never did.
+//! The manufacturer documents none of this: every constant below is
+//! reverse-engineered, and the bytes this module leaves opaque are opaque because
+//! nobody has worked out what they mean. Two rules are strict on purpose: a frame
+//! ends at `0x5B` and at nothing else - notably not at `0x0A`, which is a perfectly
+//! ordinary payload byte, being a temperature of 10 degC - and every received
+//! checksum is verified before the frame is believed.
 //!
 //! # Framing
 //!
@@ -54,27 +53,23 @@ const STATUS_MIN_LEN: usize = offset::ELEMENT + 1;
 
 /// The longest payload the [`Decoder`] will buffer.
 ///
-/// The real length of a status frame is not known - the ESPHome reader just
-/// consumes to the terminator, and it only ever looked at the first twelve bytes -
-/// so this is generous rather than exact. A frame that overruns it is reported as
-/// [`Received::TooLong`] so that a bench log answers the question for good.
+/// The real length of a status frame is not known: only the first twelve payload
+/// bytes have meanings we can name, and nothing fixes an upper bound - so this is
+/// generous rather than exact. A frame that overruns it is reported as
+/// [`Received::TooLong`] rather than silently truncated, so a longer frame than
+/// this shows up in the log instead of being mistaken for a short one.
 pub const MAX_PAYLOAD: usize = 32;
 
 /// Every outbound frame is the same size: `0x5A`, thirteen payload bytes, the
 /// checksum, `0x5B`.
 pub const COMMAND_LEN: usize = COMMAND_PAYLOAD_LEN + 3;
 
-/// Thirteen, and the thirteenth byte is the interesting one.
+/// Thirteen: twelve bytes of command and a thirteenth `0x00` pad, with the
+/// checksum computed over all thirteen.
 ///
-/// ESPHome's two templates are `uint8_t[12]`, but its `send_command_` writes and
-/// checksums index 12 - one past the end of both arrays. For the power command
-/// that happens to land on an adjacent member that is already `0x00`; for the
-/// temperature command it is whatever memory follows the object, and the checksum
-/// covers it. That build works, which means either the Mill does not validate the
-/// checksum or the stray byte is reliably zero.
-///
-/// So: thirteen payload bytes, the thirteenth a `0x00` pad, with a correct
-/// checksum over all thirteen. That frame is right under either explanation.
+/// The pad carries nothing and the Mill would very likely accept a twelve-byte
+/// frame too, but a thirteen-byte one is what it is known to accept, so that is
+/// what goes out.
 const COMMAND_PAYLOAD_LEN: usize = 13;
 
 /// `0x47`: power on/off. The argument is payload byte 5.
@@ -170,8 +165,8 @@ const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
-// The three worked examples from `MILL-HARDWARE-INTERFACE.md`, checked at compile
-// time. The encoder is `const fn` precisely so that this costs nothing at runtime:
+// Three worked examples, checked at compile time. The encoder is `const fn`
+// precisely so that this costs nothing at runtime:
 // there is no test harness on a bare-metal target, and a wire protocol nobody can
 // run tests against still deserves a byte-for-byte fixture.
 const _: () = assert!(bytes_eq(
@@ -260,9 +255,9 @@ pub enum Received<'a> {
 
 /// A byte-at-a-time receiver for the envelope above.
 ///
-/// Deliberately length-agnostic - the true length of a status frame is one of the
-/// open hardware questions - but *not* terminator-agnostic: only `0x5B` ends a
-/// frame, and the checksum decides whether what arrived is worth believing.
+/// Deliberately length-agnostic - the true length of a status frame is not fixed by
+/// anything we know - but *not* terminator-agnostic: only `0x5B` ends a frame, and
+/// the checksum decides whether what arrived is worth believing.
 pub struct Decoder {
     buf: [u8; MAX_PAYLOAD],
     len: usize,

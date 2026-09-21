@@ -25,18 +25,16 @@
 # wrong by the same factor.
 #
 # Read it off the plate on the back of the heater. Mill ships the same Gen 2 panel
-# from roughly 250 W to 2000 W; 600 is what the unit this was developed against is
-# rated at, inherited from the ESPHome config it replaced, and it is a configured
-# number there too - not a measurement.
+# from roughly 250 W to 2000 W; 600 is the rating of the unit this was developed
+# against - a configured number, never a measurement.
 element_watts = 600
 
 # The setpoint range the thermostat offers, in whole degrees Celsius.
 #
-# 5-35 is the range the Mill's own front panel offers. The hardware reportedly
-# accepts setpoints below 5 - a commit that tried 3 was reverted with "less than 5
-# min temp works, but the default is min 5 degrees" - but the panel is what a user
-# can see and check against. Becomes AbsMinHeatSetpointLimit/AbsMaxHeatSetpointLimit,
-# and the factory default for the writable Min/MaxHeatSetpointLimit pair.
+# 5-35 is the range the Mill's own front panel offers. The hardware itself reportedly
+# accepts setpoints below 5, but the panel is what a user can see and check against.
+# Becomes AbsMinHeatSetpointLimit/AbsMaxHeatSetpointLimit, and the factory default for
+# the writable Min/MaxHeatSetpointLimit pair.
 #
 # Narrowing this on an already-commissioned device clamps the stored limits into the
 # new band on the next boot rather than preserving them.
@@ -102,7 +100,10 @@ unique_id_prefix = "MILLMOD-"
 
 [commissioning]
 # The passcode and discriminator behind the QR and manual pairing codes, which the
-# firmware prints at boot - change these and the printed codes follow.
+# firmware prints at boot - change these and the printed codes follow. They are also
+# all it takes to regenerate those codes on a workstation, so a board already sealed
+# inside a heater can still be commissioned; the README has the `chip-tool payload`
+# commands.
 #
 # Give a second board its own discriminator. Two boards advertising 3840 at the same
 # time are genuinely ambiguous to a commissioner, which is the one commissioning

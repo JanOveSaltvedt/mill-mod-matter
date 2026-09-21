@@ -404,11 +404,10 @@ impl ThermostatHooks for ThermostatDeviceLogic<'_> {
         .with_cmds(with!(thermostat_cluster::CommandId::SetpointRaiseLower))
         .with_events(with!());
 
-    /// The range the Mill's own front panel offers (`mill_panelheater_gen2.cpp`
-    /// sets 5-35 as its visual min/max), rather than the rs-matter spec defaults
-    /// of 7-30. The hardware reportedly accepts below 5degC - a commit that tried
-    /// 3degC was reverted with "less than 5 min temp works, but the default is min
-    /// 5 degrees" - but the panel is what a user can see and check against.
+    /// The range the Mill's own front panel offers, 5-35, rather than the
+    /// rs-matter spec defaults of 7-30. The hardware itself reportedly accepts
+    /// setpoints below 5degC, but the panel is what a user can see and check
+    /// against.
     ///
     /// `heater.min_setpoint_celsius` and `heater.max_setpoint_celsius` in
     /// `config.toml`. These are associated consts, which is half the reason the

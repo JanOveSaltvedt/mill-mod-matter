@@ -1,9 +1,9 @@
 //! The heater: the UART link to the Mill's own microcontroller, the state it
 //! reports, and the energy counters derived from it.
 //!
-//! This is the one module that touches hardware. It is *not* a relay driver: the
+//! This is the one module that touches hardware, and all it drives is a UART: the
 //! Mill keeps its temperature sensor, its triac and its whole control loop, and
-//! this board replaces only the WiFi module that used to advise it. So the two
+//! this board replaces only the WiFi module that advises it. So the two
 //! directions are asymmetric, and deliberately so:
 //!
 //! - **Out** ([`MillHeater::request_power`], [`MillHeater::request_setpoint`]):
@@ -58,12 +58,11 @@ const SLOW_WRITE_MS: u64 = 20;
 /// How long the Mill may stay silent before everything it told us is treated as
 /// stale.
 ///
-/// The Mill pushes status frames unprompted and nothing ever polls it, so the
-/// real cadence is a hardware question still to be answered - hence a timeout
-/// generous enough not to trip over a slow one. When it does trip, the readings
-/// go null rather than staying frozen at whatever arrived last: a thermostat that
-/// keeps reporting a temperature it can no longer see is worse than one that
-/// admits it does not know.
+/// The Mill pushes status frames unprompted and nothing ever polls it, and its
+/// cadence is not specified anywhere - hence a timeout generous enough not to trip
+/// over a slow one. When it does trip, the readings go null rather than staying
+/// frozen at whatever arrived last: a thermostat that keeps reporting a temperature
+/// it can no longer see is worse than one that admits it does not know.
 pub const STATUS_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(120);
 
 /// How many bytes are taken off the UART at a time. One frame's worth, near
@@ -81,11 +80,10 @@ const MALFORMED_LOG_LIMIT: u32 = 8;
 /// How many well-formed frames are logged raw at `info` before the raw logging
 /// drops to `debug`.
 ///
-/// Most of a status frame is still unidentified - bytes 0-3, 5, 8, 10 and
-/// anything past 11 - as is its true length and the cadence the Mill pushes it
-/// at. Those are bench questions, and the answer to all three is a handful of
-/// frames at the top of the log on a default build, rather than a rebuild with
-/// `ESP_LOG=debug`.
+/// Most of a status frame is unidentified - bytes 0-3, 5, 8, 10 and anything past
+/// 11 - as is its true length and the cadence the Mill pushes it at. A handful of
+/// raw frames at the top of the log is what lets somebody decode more of it from a
+/// default build, without a rebuild at `ESP_LOG=debug`.
 const RAW_LOG_LIMIT: u32 = 8;
 
 /// What a status frame - or the silence that expires one - moved.
@@ -438,8 +436,8 @@ impl<'a> MillHeater<'a> {
                 let status = Status::parse(payload);
 
                 if status.is_none() {
-                    // Not a defect, just a frame type the ESPHome component
-                    // dropped without ever logging. Worth seeing.
+                    // Not a fault - just a frame type this decoder has no
+                    // meaning for. Worth seeing.
                     debug!(
                         "Mill: ignoring frame with opcode {:?}",
                         mill::opcode(payload)
@@ -565,14 +563,13 @@ impl<'a> MillHeater<'a> {
     /// one executor task, so for as long as a write runs, the OpenThread radio
     /// future, its alarms and the Mill UART are all stopped.
     ///
-    /// Hence the rate limit. This used to write on every period that drew
-    /// anything, which for an element that stays on is a write every
-    /// [`ENERGY_PERIOD`]: some 17 000 a day into an NVS partition whose erase
-    /// budget is shared with the whole Matter state, and 17 000 stalls a day in a
-    /// radio stack that has a parent to answer to. The cost of the other side of
-    /// the trade is that an unclean power-off now loses up to
-    /// [`ENERGY_PERSIST_INTERVAL`] of accumulated energy - for a lifetime total,
-    /// much the cheaper of the two.
+    /// Hence the rate limit. Writing on every period that drew anything would,
+    /// for an element that stays on, mean a write every [`ENERGY_PERIOD`]: some
+    /// 17 000 a day into an NVS partition whose erase budget is shared with the
+    /// whole Matter state, and 17 000 stalls a day in a radio stack that has a
+    /// parent to answer to. The cost of the other side of the trade is that an
+    /// unclean power-off loses up to [`ENERGY_PERSIST_INTERVAL`] of accumulated
+    /// energy - for a lifetime total, much the cheaper of the two.
     fn persist_energy(&self) {
         let started = embassy_time::Instant::now().as_millis();
         let energy_mws = self.energy_mws.get();

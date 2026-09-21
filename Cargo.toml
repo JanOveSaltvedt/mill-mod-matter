@@ -43,12 +43,12 @@ log = "0.4"
 #                              `AddNOC` propagates that, aborting commissioning. The
 #                              `AccessControlEntryChanged` event rs-matter emits for
 #                              the admin ACL entry seeded by `AddNOC` measures 65-67
-#                              bytes with a random 64-bit operational node ID (any
-#                              real controller), so 64 was too small; it only fit
-#                              chip-tool's 3-byte node ID 112233. Our own energy
-#                              events are 45-61 bytes and grow with the running
-#                              totals and uptime. 256 buys headroom in all three
-#                              rings for 576 bytes of static RAM.
+#                              bytes with a random 64-bit operational node ID, which
+#                              is what any real controller assigns - so nothing below
+#                              `size-128` can carry it. Our own energy events are
+#                              45-61 bytes and grow with the running totals and
+#                              uptime. 256 buys headroom in all three rings for 576
+#                              bytes of static RAM.
 # - `groups`                   the Groups cluster we serve on the thermostat endpoint
 rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-features = false, features = [
     "esp",

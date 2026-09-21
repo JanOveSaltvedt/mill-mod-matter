@@ -8,24 +8,15 @@ Firmware for a **hardware mod to a Mill Gen 2 WiFi panel heater**: its WiFi
 controller is replaced with an ESP32-C6 that presents the heater to Matter as a
 heating Thermostat over **Thread**, metering its own heating element.
 
-The mod does **not** drive a relay and does **not** read a thermistor. The Mill's
-own MCU keeps the sensor, the triac and the whole control loop; this board replaces
-the WiFi module and speaks that module's 9600-baud UART protocol - it *receives*
-status and *sends* setpoint and on/off requests. `MILL-HARDWARE-INTERFACE.md` is the
-reference for every byte of it.
+The Mill's own MCU keeps the sensor, the triac and the whole control loop. This board
+replaces the WiFi module and speaks that module's 9600-baud UART protocol - it
+*receives* status and *sends* setpoint and on/off requests, and drives nothing itself.
+`src/mill.rs` is the reference for every byte of that protocol.
 
 `no_std`, no-alloc-except-where-forced, single `embassy` executor task. One binary,
 built from `src/main.rs`.
 
 **Target specification version: Matter 1.6**, inherited from `rs-matter`.
-
-### Milestone status
-
-| | |
-| --- | --- |
-| Milestone 1 (**done**) | Real BLE commissioning, Thread join, SRP, data model and NVS persistence, against a simulated heater. |
-| Milestone 2 (**written, not yet run on hardware**) | The real Mill UART: `src/mill.rs` (wire protocol) and `src/heater.rs` (UART + reported state) replaced the simulation, and `src/thermostat.rs` lost its control loop. |
-| Next | Bench bring-up. The nine open questions at the end of `MILL-HARDWARE-INTERFACE.md` are all answered by logs from a wired unit; the first frames are logged raw at `info` on purpose. |
 
 ## The four repositories
 
@@ -150,7 +141,7 @@ Re-exports worth knowing, so you never depend on `rs-matter` directly:
 
 ## Gotchas
 
-Each of these cost real investigation. None is obvious from the code.
+None of these is obvious from the code.
 
 - **Events are off by default.** `events-ringbuf-size-0` is the default in
   `rs-matter-stack` *and* `rs-matter-embassy`. Without an `events-ringbuf-size-*`
@@ -165,9 +156,8 @@ Each of these cost real investigation. None is obvious from the code.
   with nothing but `Error invoking command: ResourceExhausted`. The culprit is the
   `AccessControlEntryChanged` event rs-matter emits for the admin ACL entry
   `AddNOC` seeds: 65-67 bytes once the operational node ID is a random 64-bit one,
-  which every real controller assigns. `size-64` only ever worked against
-  chip-tool, whose fixed node ID 112233 encodes in three bytes. We ship
-  `events-ringbuf-size-256`; our own energy events are 45-61 bytes and grow with
+  which every real controller assigns, so nothing below `size-128` can carry it. We
+  ship `events-ringbuf-size-256`; our own energy events are 45-61 bytes and grow with
   the running totals and uptime.
 - **`VENDOR_KEYS_START` is already taken.** On a Thread device `rs-matter-embassy`
   keeps OpenThread's SRP ECDSA key at exactly `VENDOR_KEYS_START`
@@ -224,14 +214,15 @@ Each of these cost real investigation. None is obvious from the code.
   does - then folds two physically different boards into one record, so a bench
   board and a heater commissioned onto the same fabric collapse into one device
   while the controller still sees two nodes. `dev_det()` in `main.rs` derives both
-  strings from the factory MAC instead, and `config.toml` now supplies the rest of the
-  block - which is also what fixed the `device_name: "MyTest"` and
-  `manufacturing_date: "20221004"` this used to inherit. The VID/PID and test DAC are
-  still shared by every board and that is fine - neither is what a controller files a
-  device under, and the VID/PID deliberately cannot be configured because the test DAC
-  is issued for them. The passcode and discriminator are shared only by default:
-  `[commissioning]` exists because two boards advertising discriminator 3840 at the
-  same time are genuinely ambiguous to a commissioner.
+  strings from the factory MAC instead, and `config.toml` supplies the rest of the
+  block. The VID/PID and test DAC are still shared by every board and that is fine -
+  neither is what a controller files a device under, and the VID/PID deliberately
+  cannot be configured because the test DAC is issued for them. The passcode and
+  discriminator are shared only by default: `[commissioning]` exists because two
+  boards advertising discriminator 3840 at the same time are genuinely ambiguous to a
+  commissioner. Those two are also all a workstation needs to regenerate the printed
+  QR and manual codes - see the README's `chip-tool payload` recipe, which is how a
+  board sealed inside a heater gets commissioned.
 - **The device is uncertified.** It ships `rs-matter`'s test DAC/PAI and the CSA test
   VID/PID, so every commissioner warns about it. Expected on a private fabric.
 
@@ -250,8 +241,7 @@ Each of these cost real investigation. None is obvious from the code.
 - **`heater.element_watts` does not invalidate the stored energy counter.** The blob is
   milliwatt-*seconds* of energy already integrated, not accumulated on-time, so a
   corrected plate rating leaves the lifetime total monotone - it just becomes two
-  segments at two rates. Had it stored on-time, every wattage change would have
-  retroactively rewritten history and needed a migration.
+  segments at two rates, and needs no migration.
 - **The restored setpoint limits are clamped to the absolute range.** Narrowing
   `heater.min/max_setpoint_celsius` on a commissioned device would otherwise leave the
   persisted `Min/MaxHeatSetpointLimit` outside `AbsMin/AbsMaxHeatSetpointLimit`, which
@@ -260,12 +250,12 @@ Each of these cost real investigation. None is obvious from the code.
 
 ### The Mill link
 
-- **GPIO16/17 are UART0's default console pins.** The Mill takes them, so the
-  console is pinned to USB Serial/JTAG (`esp-println`'s `jtag-serial` feature,
-  `default-features = false`) and the Mill gets UART1. Leaving `esp-println` on its
-  default `auto` would have it fall back to UART0 whenever no USB host is attached
-  and spray log lines at the heater's MCU. The ROM bootloader still talks on UART0 at
-  reset; nothing can be done about that and the Mill ignores it.
+- **`esp-println` must be pinned to `jtag-serial`,** with `default-features = false`.
+  The console lives on USB Serial/JTAG and the Mill has UART1 on GPIO16/17 - which are
+  UART0's default console pins, so on the default `auto` backend `esp-println` falls
+  back to UART0 whenever no USB host is attached and sprays log lines at the heater's
+  MCU. The ROM bootloader still talks on UART0 at reset; nothing can be done about
+  that and the Mill ignores it.
 - **The lifetime on `MillHeater`'s UART halves is `'static`, deliberately.** They have
   destructors, so a borrowed lifetime would have to outlive the heater's own drop -
   and `ThermostatDeviceLogic` holds `&'a MillHeater<'a>`, which *is* that lifetime.
@@ -286,11 +276,10 @@ Each of these cost real investigation. None is obvious from the code.
   last. `MillHeater::recv_status` therefore resolves on *any* status frame, not only
   on one that changed something - a steady-state heater repeating itself must not look
   like a heater that has stopped talking.
-- **ESPHome's implementation has real defects** - it breaks frames on `0x0A` (which
-  is a room temperature of exactly 10 degC), never verifies a received checksum, and
-  overruns its command buffer by one byte. `MILL-HARDWARE-INTERFACE.md` lists them
-  under "Known weaknesses"; none is reproduced here. Do not "fix" `mill.rs` to match
-  the C++.
+- **`0x5B` is the only frame terminator, and every checksum is verified.** `0x0A`
+  looks like a terminator but is an ordinary payload byte: a temperature of exactly
+  10 degC. A decoder that breaks on it truncates that frame and then silently serves
+  the *previous* frame's readings. Both rules are load-bearing, not taste.
 
 ## Conventions
 

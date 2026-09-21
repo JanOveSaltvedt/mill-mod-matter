@@ -1,10 +1,9 @@
 //! Turns `config.toml` into the constants `src/config.rs` exposes.
 //!
-//! Build-time rather than runtime for three reasons: the device has no filesystem to
-//! read a config from at boot; several of the values land in `const` contexts that a
-//! runtime value could not satisfy (`ThermostatHooks::ABS_MIN_HEAT_SETPOINT`,
-//! `ElecPwrMeasHooks::ACCURACY`); and it matches what the ESPHome implementation this
-//! replaced did with its own YAML, which was also resolved into generated C++.
+//! Build-time rather than runtime for two reasons: the device has no filesystem to
+//! read a config from at boot, and several of the values land in `const` contexts
+//! that a runtime value could not satisfy (`ThermostatHooks::ABS_MIN_HEAT_SETPOINT`,
+//! `ElecPwrMeasHooks::ACCURACY`).
 //!
 //! `config.local.toml`, if it exists, is merged over `config.toml` key by key so that
 //! a differently-rated unit builds from a clean tree. The merged table is then

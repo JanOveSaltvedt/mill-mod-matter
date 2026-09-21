@@ -2,9 +2,9 @@
 //! Mill Gen 2 panel heater, replacing its WiFi controller.
 //!
 //! Endpoint 1 carries two device types. The Thermostat (`0x0301`, `HEAT`) is backed
-//! by [`MillHeater`], which is not a relay driver: the Mill's own microcontroller
-//! keeps the temperature sensor, the triac and the control loop, and this board
-//! replaces only the WiFi module that used to advise it over a 9600-baud UART.
+//! by [`MillHeater`], which observes rather than drives: the Mill's own
+//! microcontroller keeps the temperature sensor, the triac and the control loop, and
+//! this board replaces only the WiFi module that advises it over a 9600-baud UART.
 //! Beside the thermostat sits an Electrical Sensor (`0x0510`) - a *utility* device
 //! type, so the two share an endpoint - reporting the heating element through Power
 //! Topology, Electrical Power Measurement and Electrical Energy Measurement: what
@@ -13,8 +13,7 @@
 //! the element's plate rating and the on/off bit the Mill reports, which is why
 //! `meter.rs` serves `ActivePower` and the energy totals and nothing else.
 //!
-//! The wire protocol is in `mill.rs` and the UART that carries it in `heater.rs`;
-//! `MILL-HARDWARE-INTERFACE.md` records where every byte of it came from.
+//! The wire protocol is in `mill.rs` and the UART that carries it in `heater.rs`.
 //!
 //! The structure is lifted from `rs-matter-embassy`'s own examples: see
 //! `../rs-matter-embassy/examples/esp/src/bin/light_thread.rs` for the stack wiring
@@ -162,15 +161,14 @@ async fn main(_s: Spawner) {
     );
 
     // The Mill UART: GPIO16 out to the heater's MCU, GPIO17 back, 9600 8N1 (the rest
-    // of `Config::default()`), no flow control. The pin assignment is inherited
-    // from the ESPHome build that has been driving the deployed unit.
+    // of `Config::default()`), no flow control. The pins are the ones wired to the
+    // Mill's module header.
     //
-    // Note that these are also the ESP32-C6's *default UART0 console* pins, which
-    // is why UART1 carries the Mill and the log console lives on the USB
-    // Serial/JTAG peripheral instead - see the `esp-println` features in
-    // `Cargo.toml`. The ROM bootloader still says its piece on UART0 at reset,
-    // before any of this runs; those bytes do reach the Mill's MCU, framed as
-    // nothing it understands.
+    // They are also the ESP32-C6's *default UART0 console* pins, which is why the
+    // Mill gets UART1 while the log console goes out over USB Serial/JTAG - see the
+    // `esp-println` features in `Cargo.toml`. The ROM bootloader still says its
+    // piece on UART0 at reset, before any of this runs; those bytes do reach the
+    // Mill's MCU, framed as nothing it understands.
     let mill_uart = esp_hal::uart::Uart::new(
         peripherals.UART1,
         esp_hal::uart::Config::default().with_baudrate(mill::BAUD_RATE),
@@ -379,14 +377,12 @@ async fn main(_s: Spawner) {
 /// The identity strings that have to differ from board to board, derived once at
 /// boot from the chip's factory MAC.
 ///
-/// These were `rs-matter`'s test constants until a second ESP32-C6 running this
-/// firmware appeared on the same network. `TEST_DEV_DET` hard-codes
+/// `rs-matter`'s `TEST_DEV_DET` cannot serve here: it hard-codes
 /// `serial_no: "123456789"` and inherits an empty `unique_id` from
 /// `BasicInfoConfig::new()`, so *every* board built from it reports the same
 /// `SerialNumber` and no `UniqueID` at all. A controller that keys its own device
 /// records on the serial number - Home Assistant does, alongside the node ID -
-/// then folds two physically different nodes into one device, which is how a
-/// bench board and a heater end up sharing an entry.
+/// folds two physically different nodes into one device on that alone.
 ///
 /// `BasicInfoConfig` borrows every string it serves, so these have to outlive the
 /// Matter stack; hence [`dev_det`] and its `StaticCell`s rather than a `const`.
@@ -397,7 +393,7 @@ struct DeviceIdentity {
     /// The serial number behind [`config::UNIQUE_ID_PREFIX`].
     ///
     /// `UniqueID` is mandatory from Basic Information cluster revision 4, which is
-    /// what Matter 1.6 asks for, and this device was serving the empty string.
+    /// what Matter 1.6 asks for, and `BasicInfoConfig::new()` leaves it empty.
     /// Deriving it from the MAC rather than minting a random one and persisting it
     /// is deliberate: the attribute is `persistence="fixed"`, and a value living in
     /// the KV store would not survive the factory reset that a fixed value must.
@@ -455,8 +451,8 @@ fn hex(bytes: &[u8], out: &mut [u8]) {
 /// with the certificate would fail device attestation outright rather than merely
 /// warn, so those two are deliberately not configurable.
 ///
-/// The serial number and the unique ID are derived per board, and that is why this is
-/// a function rather than the `const` it used to be - see [`DeviceIdentity`].
+/// The serial number and the unique ID are derived per board, which is why this is a
+/// function rather than a `const` - see [`DeviceIdentity`].
 ///
 /// Called exactly once; a second call panics on the already-initialised
 /// `StaticCell`, which is the right way for that mistake to show up.

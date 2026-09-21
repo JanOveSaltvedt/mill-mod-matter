@@ -1,8 +1,8 @@
 # Partition table for a 4 MB ESP32-C6.
 #
-# Sized from measurement, not guesswork: the milestone-1 image is ~1.86 MiB of
-# loadable segments (`readelf -lW` on the release ELF), so `factory` is given all
-# the room that is left rather than the 1 MiB an espflash default would hand it.
+# Sized from measurement, not guesswork: the release image is ~1.86 MiB of loadable
+# segments (`readelf -lW` on the release ELF), so `factory` is given all the room
+# that is left rather than the 1 MiB an espflash default would hand it.
 #
 # `nvs` is 64 KiB rather than the default 24 KiB because it holds *everything*
 # persistent: rs-matter's fabrics/ACLs/sessions, the Thread credentials, the
