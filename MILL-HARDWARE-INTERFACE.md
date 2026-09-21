@@ -117,8 +117,12 @@ openthread:
 Two things to carry over:
 
 - **`device_type: FTD`.** A mains-powered panel heater is always on, so it joins as
-  a Full Thread Device and is router-eligible - not an SED/MTD. Our firmware should
-  match; there is no battery to protect and a router in the room is useful.
+  a Full Thread Device and is router-eligible - not an SED/MTD. There is no battery
+  to protect and a router in the room is useful, so our firmware should match
+  eventually - but **not yet**. Building `rs-matter-embassy` with `openthread-ftd`
+  (plus the larger shared OpenThread/mbedTLS heap it needs) was tried and reverted:
+  the node did route, but the stack was not stable enough for it. Revisit once
+  rs-matter has matured; until then we join as an MTD End Device.
 - **`force_dataset: true` does not apply to us.** The ESPHome build was handed a
   hardcoded operational dataset and skipped commissioning entirely. Our device gets
   its dataset from BLE commissioning, which is the whole point of milestone 1. The

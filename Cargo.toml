@@ -25,19 +25,7 @@ log = "0.4"
 # - `esp`                      esp-hal/esp-radio flavoured drivers (`EspThreadDriver`)
 # - `trouble`                  pure-Rust BLE host, for commissioning
 # - `openthread` + `mbedtls`   Thread transport, sharing OpenThread's mbedTLS
-# - `openthread-ftd`           build OpenThread as a Full Thread Device, so this
-#                              mains-powered node routes for the mesh instead of
-#                              hanging off a parent as an End Device. Links
-#                              `libopenthread-ftd.a` in place of the MTD archive and
-#                              unlocks the real route table plus the REED refinement
-#                              in `rs-matter-embassy`'s `ThreadDiag`. Note this is
-#                              safe to enable on an already-commissioned device only
-#                              because `rs-matter-embassy` keeps OpenThread's
-#                              settings in RAM (all but the SRP ECDSA key): an FTD
-#                              build restores a persisted device mode verbatim
-#                              (`Mle::Restore`), so a node that had stored its MTD
-#                              mode would silently stay an End Device.
-# - `openthread-heap-int-*`    OpenThread's internal heap, shared with mbedTLS
+# - `openthread-heap-int-8192` OpenThread's internal heap, shared with mbedTLS
 # - `events-ringbuf-size-256`  MUST be set: the default is `events-ringbuf-size-0`,
 #                              i.e. events are silently never emitted, which would
 #                              mute Electrical Energy Measurement's two events.
@@ -59,9 +47,8 @@ rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-f
     "log",
     "trouble",
     "openthread",
-    "openthread-ftd",
     "mbedtls",
-    "openthread-heap-int-32768",
+    "openthread-heap-int-8192",
     "events-ringbuf-size-256",
     "groups",
 ] }
