@@ -73,10 +73,18 @@ cargo fmt -- --check
 # One-off
 cargo install espflash
 
-# Flash + monitor. The `.cargo/config.toml` runner does the same, so `cargo run
-# --release` works too.
-espflash flash --monitor --partition-table partitions.csv --baud 1500000 \
+# Flash + monitor. The `.cargo/config.toml` runner is exactly this, so `cargo run
+# --release` works too. The partition table and the flashing baud rate come from
+# `espflash.toml` - run espflash from the project root so it finds that file, or
+# the board silently gets espflash's own table and a 24 KiB `nvs`.
+espflash flash --monitor \
     target/riscv32imac-unknown-none-elf/release/mill-mod-matter
+
+# Only the NVS range, when the store has to go but the app need not be reflashed.
+# `erase-parts` is the one subcommand that ignores `espflash.toml`'s partition
+# table, so it has to be named here (`espflash.rs`'s `erase_parts` only ever reads
+# the flag - it errors out rather than guessing).
+espflash erase-parts --partition-table partitions.csv nvs
 ```
 
 The target (`riscv32imac-unknown-none-elf`) comes from `.cargo/config.toml`; there is
@@ -85,6 +93,15 @@ incidental: `.cargo/config.toml` sets `build-std = ["core", "alloc", "panic_abor
 so `core` and `alloc` are rebuilt from source with the size-tuning flags.
 `rust-toolchain.toml` pins that. Note the C6 is RISC-V, so no `espup`/Xtensa fork is
 needed.
+
+A board flashed with the wrong partition table does not fail loudly. `main.rs`'s
+`get_persistent_store` reads the `nvs` range out of the *flashed* table at runtime,
+and `sequential-storage` is a log whose newest copy of a key wins - so a table with
+a smaller `nvs` yields a store that is truncated, not empty. Old blobs low in the
+log still load while newer writes above the new end are invisible, and the device
+boots "already commissioned" with stale setpoints and no Thread credentials
+(`No networks available`). The `Will use NVS partition` line at startup is the
+check: it must read `0x9000..0x19000`.
 
 `partitions.csv` is sized from a measurement of the release ELF, not a guess - see
 the comment in the file. Re-check it when the image grows:

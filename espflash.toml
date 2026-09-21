@@ -1,0 +1,17 @@
+# espflash's project configuration, read from the directory espflash is invoked
+# from (or its parent) - see `Config::find_config_path` in espflash 4.x.
+#
+# `partition_table` lives here rather than in the `.cargo/config.toml` runner so
+# that *every* route to the board gets it: `cargo run`, a bare `espflash flash`,
+# and `cargo espflash`. Getting it wrong is silent and expensive - espflash falls
+# back to its own default table, whose `nvs` is 24 KiB at 0x9000 instead of our
+# 64 KiB, and the KV store then comes up truncated rather than empty. Fabrics and
+# other old blobs still load from the first six pages while anything written
+# above 0xf000 - the Thread credentials among them - simply vanishes, so the
+# device boots "already commissioned" with no network to join.
+#
+# A command-line flag still wins over this file.
+baudrate = 1500000
+
+[idf_format_args]
+partition_table = "partitions.csv"
