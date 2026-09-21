@@ -2769,8 +2769,10 @@ dependencies = [
  "log",
  "portable-atomic",
  "rs-matter-embassy",
+ "serde",
  "static_cell",
  "tinyrlibc",
+ "toml",
 ]
 
 [[package]]

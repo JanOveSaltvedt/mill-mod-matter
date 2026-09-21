@@ -62,6 +62,78 @@ pins, and the ROM bootloader's own chatter at reset does go out to the heater.
 The toolchain (nightly + `rust-src` + the RISC-V target) is pinned by
 `rust-toolchain.toml` and installs itself on first build.
 
+## Configuration
+
+Per-unit settings live in **`config.toml`** at the repo root, which documents every key
+inline. `build.rs` validates the file and generates `src/config.rs` from it, so a bad
+value fails the build with a sentence instead of reaching a board.
+
+It is resolved at build time, not read at boot: there is no filesystem on the device,
+and several of the values land in `const` contexts that a runtime value could not
+satisfy. The ESPHome config this mod replaced worked the same way - its YAML was
+compiled into generated C++.
+
+To change something, either edit `config.toml`, or - better, since it keeps your tree
+clean - put just the keys you want in **`config.local.toml`**, which is gitignored and
+merged over the defaults key by key:
+
+```toml
+[heater]
+element_watts = 1200
+```
+
+Then `cargo build --release` and reflash. Touching either file re-runs the generator.
+
+### The one key to get right
+
+**`heater.element_watts`.** There is no metering hardware in the Mill and the mod did
+not add any, so every reading the Electrical Power and Electrical Energy Measurement
+clusters serve is this number gated on one bit of the Mill's status frame. Get it wrong
+and the power reading is wrong and the lifetime energy total is wrong by the same
+factor. Read it off the plate on the back of the heater - Mill ships the same Gen 2
+panel from roughly 250 W to 2000 W, and the default here is the 600 W unit this was
+developed against.
+
+Changing it later is safe and needs no migration: the persisted counter holds
+milliwatt-*seconds* of energy already integrated, not accumulated on-time, so the
+lifetime total stays monotone. It simply becomes a sum of two segments computed at two
+rates, which is the honest answer for a device whose plate rating was corrected.
+
+### The rest
+
+| Section | Keys |
+| --- | --- |
+| `[heater]` | `element_watts`, the setpoint range (`min`/`max`/`default_setpoint_celsius`), `metering_accuracy_percent`, `circuit_max_watts` |
+| `[device]` | The Matter Basic Information strings: vendor and product name, product label, part number, hardware and software version (and their strings), manufacturing date, the mDNS `device_name`, an optional `serial_number` override, and the `unique_id_prefix` |
+| `[commissioning]` | `passcode` and `discriminator`, which are what the printed QR and manual pairing codes encode |
+
+Three notes:
+
+- **Leave `serial_number` empty.** Empty means each board derives its own from the
+  chip's factory MAC, which is what you want: a controller that files devices under the
+  serial number as well as the node ID - Home Assistant does - folds two boards sharing
+  one serial into a single device record. Setting it in a shared config file puts every
+  board built from the checkout back in that state. The `UniqueID` is always MAC-derived
+  and never follows an explicit serial.
+- **Give a second board its own `discriminator`.** Two boards advertising 3840 at once
+  are genuinely ambiguous to a commissioner. This is the one shared commissioning
+  parameter that actually causes trouble.
+- **Narrowing the setpoint range** on an already-commissioned device clamps the stored
+  `Min`/`MaxHeatSetpointLimit` into the new band on the next boot rather than preserving
+  them, since the cluster does not allow them outside `AbsMin`/`AbsMaxHeatSetpointLimit`.
+
+### What is deliberately *not* configurable
+
+| | Why |
+| --- | --- |
+| `vendor_id` / `product_id` | The test DAC/PAI is issued for the CSA test VID/PID `0xFFF1`/`0x8001`. A `BasicInformation` value disagreeing with the certificate fails device attestation outright rather than merely warning. Not configurable until there is a real DAC to go with it. |
+| The wire protocol in `src/mill.rs` | Opcodes, byte offsets, command templates and the checksum. A different protocol is a code change; the compile-time wire fixtures in that file exist to make a mismatch a build error. |
+| The 9600 baud rate | Fixed by the Mill, not a choice. |
+| UART pins and the factory-reset GPIO | Dictated by the HF-LPT120A header and the C6's Boot Mode pin. |
+| `BUMP_SIZE`, `HEAP_SIZE` | Tuned; too small panics during stack init. |
+| Sampling, persist and watchdog intervals | Internal cadence. Lowering the energy persist interval reintroduces a flash write that stalls the radio. |
+| Voltage, current, frequency, power factor | Not served at all, deliberately. There is nothing to measure them with, and a client cannot tell a derived reading from a measured one. |
+
 ## Build and flash
 
 ```sh
@@ -110,7 +182,8 @@ chip-tool electricalenergymeasurement subscribe-event cumulative-energy-measured
 `active-power` reads `600000` (mW) while the Mill has the element on and `0`
 otherwise — the element's plate rating gated on one bit of the status frame. There
 is no metering hardware in the heater and none was added, so that rating is worth
-confirming against the unit being modded.
+confirming against the unit being modded; it comes from `heater.element_watts` in
+`config.toml`.
 
 For the same reason it is the *only* power reading served: no voltage, current,
 frequency, power factor or RMS, apparent and reactive quantities. Those are all

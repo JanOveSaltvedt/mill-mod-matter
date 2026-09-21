@@ -1,1 +1,4 @@
 target/
+# Per-board overrides of `config.toml`, so a differently-rated unit builds from a
+# clean tree. See the header of `config.toml`.
+config.local.toml

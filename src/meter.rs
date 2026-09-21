@@ -37,8 +37,9 @@ use crate::heater::{MillHeater, ENERGY_PERIOD, METER_TICK};
 /// The top of the power reading's range, in milliwatts.
 ///
 /// A 16 A single-phase circuit at 230 V, which is the most the element could
-/// draw whatever it turns out to be rated at.
-const MAX_POWER_MW: i64 = 3_680_000;
+/// draw whatever it turns out to be rated at. `heater.circuit_max_watts` in
+/// `config.toml`.
+const MAX_POWER_MW: i64 = crate::config::CIRCUIT_MAX_POWER_MW;
 
 /// The top of the lifetime energy counter's range, in milliwatt-hours.
 ///
@@ -52,8 +53,12 @@ const MAX_ENERGY_MWH: i64 = i64::MAX / 3600;
 /// Not a meter's datasheet figure, because there is no meter: everything served
 /// is the element's plate rating gated on the on/off bit, so this is a claim
 /// about how close that rating is to the truth - manufacturing tolerance, and a
-/// supply that is only nominally 230 V.
-const METER_ACCURACY: u16 = 500;
+/// supply that is only nominally 230 V. `heater.metering_accuracy_percent` in
+/// `config.toml`.
+///
+/// It has to be a `const` because it feeds the `ACCURACY` associated consts below,
+/// which is half the reason the configuration is resolved at build time.
+const METER_ACCURACY: u16 = crate::config::METER_ACCURACY;
 
 /// One `Accuracy` entry: a quantity the meter reads across `0..=$max`, at
 /// [`METER_ACCURACY`] throughout that range.

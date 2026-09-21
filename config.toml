@@ -1,0 +1,114 @@
+# Per-unit configuration for this firmware.
+#
+# Everything here is resolved at BUILD time: `build.rs` parses this file, validates
+# it, and emits `src/config.rs`'s constants into `OUT_DIR`. There is no filesystem on
+# the device to read it from at boot, and several of these values land in `const`
+# contexts (`ThermostatHooks::ABS_MIN_HEAT_SETPOINT`, `ElecPwrMeasHooks::ACCURACY`)
+# that a runtime value could not satisfy. Change a value here, rebuild, reflash.
+#
+# To override without touching this tracked file, put just the keys you want in
+# `config.local.toml`, which is gitignored:
+#
+#     [heater]
+#     element_watts = 1200
+#
+# A key that is not recognised - in either file - fails the build rather than being
+# silently ignored, so a typo cannot reach a board.
+
+[heater]
+# The heating element's plate rating, in watts.
+#
+# THE one value to get right. There is no metering hardware in the Mill and none was
+# added by the mod, so every reading the Electrical Power and Electrical Energy
+# Measurement clusters serve is this number gated on one bit of the Mill's status
+# frame. If it is wrong, the power reading is wrong and the lifetime energy total is
+# wrong by the same factor.
+#
+# Read it off the plate on the back of the heater. Mill ships the same Gen 2 panel
+# from roughly 250 W to 2000 W; 600 is what the unit this was developed against is
+# rated at, inherited from the ESPHome config it replaced, and it is a configured
+# number there too - not a measurement.
+element_watts = 600
+
+# The setpoint range the thermostat offers, in whole degrees Celsius.
+#
+# 5-35 is the range the Mill's own front panel offers. The hardware reportedly
+# accepts setpoints below 5 - a commit that tried 3 was reverted with "less than 5
+# min temp works, but the default is min 5 degrees" - but the panel is what a user
+# can see and check against. Becomes AbsMinHeatSetpointLimit/AbsMaxHeatSetpointLimit,
+# and the factory default for the writable Min/MaxHeatSetpointLimit pair.
+#
+# Narrowing this on an already-commissioned device clamps the stored limits into the
+# new band on the next boot rather than preserving them.
+min_setpoint_celsius = 5
+max_setpoint_celsius = 35
+
+# The setpoint a device with nothing to restore comes up with, in whole degrees
+# Celsius. Must lie inside the range above. It only ever reaches the wire if the Mill
+# never says otherwise.
+default_setpoint_celsius = 20
+
+# How accurate the readings claim to be, in percent.
+#
+# Not a meter's datasheet figure, because there is no meter: this is a claim about how
+# close the plate rating above is to the truth - manufacturing tolerance, and a supply
+# that is only nominally 230 V. Lower it if you have actually measured the element.
+metering_accuracy_percent = 5.0
+
+# The top of the reported power range, in watts: a 16 A single-phase circuit at 230 V,
+# which is the most the element could draw whatever it turns out to be rated at. Must
+# be at least `element_watts`. Only worth touching for a different supply standard.
+circuit_max_watts = 3680
+
+[device]
+# The Matter Basic Information cluster. Every string here has a length limit from the
+# spec, enforced at build time.
+vendor_name  = "Mill Mod"
+product_name = "Mill Gen 2 Thermostat"
+
+# Optional, and empty by default. `product_label` is a human-facing short name;
+# `part_number` is the manufacturer's own, which a mod does not really have.
+product_label = ""
+part_number   = ""
+
+hardware_version        = 1
+hardware_version_string = "1"
+
+software_version = 1
+# Empty means "use the crate version from Cargo.toml", which is usually what you want.
+software_version_string = ""
+
+# YYYYMMDD. Must be a real calendar date.
+manufacturing_date = "20260921"
+
+# Not a real attribute: this is the name carried in the mDNS commissioning
+# advertisement, i.e. what a commissioner shows in its "device found" prompt.
+device_name = "Mill Panel Heater"
+
+# The SerialNumber attribute.
+#
+# EMPTY IS THE RIGHT ANSWER for almost everybody: it makes each board derive its own
+# serial from the chip's factory MAC. Setting an explicit value here puts every board
+# built from this checkout back to sharing one serial number, and a controller that
+# files devices under the serial as well as the node ID - Home Assistant does - then
+# folds two physically different boards into a single device record. Only set it if
+# you build one board at a time and have a real serial you want reported.
+serial_number = ""
+
+# Prefixed to the MAC-derived UniqueID, so that attribute is not byte-for-byte the
+# serial number. Together with the twelve hex digits of the MAC it must fit in 64
+# characters.
+unique_id_prefix = "MILLMOD-"
+
+[commissioning]
+# The passcode and discriminator behind the QR and manual pairing codes, which the
+# firmware prints at boot - change these and the printed codes follow.
+#
+# Give a second board its own discriminator. Two boards advertising 3840 at the same
+# time are genuinely ambiguous to a commissioner, which is the one commissioning
+# parameter this firmware shares that actually causes trouble.
+#
+# The passcode may not be one of the values the Core spec forbids as too weak
+# (00000000, the repeated-digit codes, 12345678, 87654321); the build rejects those.
+passcode      = 20202021
+discriminator = 3840

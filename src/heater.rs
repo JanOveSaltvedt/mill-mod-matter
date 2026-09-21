@@ -66,16 +66,6 @@ const SLOW_WRITE_MS: u64 = 20;
 /// admits it does not know.
 pub const STATUS_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(120);
 
-/// The rated power of the heating element, in milliwatts.
-///
-/// 600 W, the rating the deployed ESPHome unit is configured with
-/// (`mill-salongen.yaml`). That is a *configured* number rather than a
-/// measurement, and the Mill has no metering of its own to check it against -
-/// every reading the Electrical Sensor clusters serve is this constant gated on
-/// the element being on, so the plate rating of the unit being modded is the one
-/// thing worth confirming before believing the energy figures.
-pub const ELEMENT_POWER_MW: i64 = 600_000;
-
 /// How many bytes are taken off the UART at a time. One frame's worth, near
 /// enough; the decoder is fed byte by byte regardless.
 const RX_CHUNK: usize = 32;
@@ -356,9 +346,13 @@ impl<'a> MillHeater<'a> {
     }
 
     /// The power drawn right now, in milliwatts.
+    ///
+    /// The element's plate rating gated on one bit of the status frame - there is no
+    /// metering in the heater. `heater.element_watts` in `config.toml` carries the
+    /// rating, and why getting it right matters.
     pub fn active_power_mw(&self) -> i64 {
         if self.heating() {
-            ELEMENT_POWER_MW
+            crate::config::ELEMENT_POWER_MW
         } else {
             0
         }

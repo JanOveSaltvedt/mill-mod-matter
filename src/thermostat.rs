@@ -44,9 +44,11 @@ use rs_matter_embassy::matter::with;
 use crate::heater::{Changed, MillHeater, STATUS_TIMEOUT};
 use crate::vendor_kv::{VendorKv, THERMOSTAT_STATE_KEY};
 
-/// The setpoint a device with nothing to restore comes up with: 20.00degC. It
-/// only ever reaches the wire if the Mill never says otherwise.
-const DEFAULT_HEATING_SETPOINT: i16 = 2000;
+/// The setpoint a device with nothing to restore comes up with. It only ever reaches
+/// the wire if the Mill never says otherwise.
+///
+/// `heater.default_setpoint_celsius` in `config.toml`.
+const DEFAULT_HEATING_SETPOINT: i16 = crate::config::DEFAULT_HEATING_SETPOINT;
 
 /// How long a command frame is given to show up in the status stream before the
 /// Mill's own report is believed over it.
@@ -145,10 +147,23 @@ impl<'a> ThermostatDeviceLogic<'a> {
             _ => PersistentState::default(),
         };
 
+        // The restored limits are clamped into the absolute range, and the setpoint
+        // into the result. The blob predates the running firmware, so a narrower
+        // `heater.min/max_setpoint_celsius` in `config.toml` would otherwise leave
+        // `Min/MaxHeatSetpointLimit` outside `AbsMin/AbsMaxHeatSetpointLimit`, which
+        // the cluster does not allow - and it costs nothing to be robust against a
+        // corrupt blob at the same time.
+        let min = state
+            .min_heat_setpoint_limit
+            .clamp(Self::ABS_MIN_HEAT_SETPOINT, Self::ABS_MAX_HEAT_SETPOINT);
+        let max = state
+            .max_heat_setpoint_limit
+            .clamp(min, Self::ABS_MAX_HEAT_SETPOINT);
+
         Self {
-            occupied_heating_setpoint: Cell::new(state.occupied_heating_setpoint),
-            min_heat_setpoint_limit: Cell::new(state.min_heat_setpoint_limit),
-            max_heat_setpoint_limit: Cell::new(state.max_heat_setpoint_limit),
+            occupied_heating_setpoint: Cell::new(state.occupied_heating_setpoint.clamp(min, max)),
+            min_heat_setpoint_limit: Cell::new(min),
+            max_heat_setpoint_limit: Cell::new(max),
             system_mode: Cell::new(state.system_mode),
             applied: Cell::new(false),
             pending_setpoint: Cell::new(None),
@@ -394,8 +409,12 @@ impl ThermostatHooks for ThermostatDeviceLogic<'_> {
     /// of 7-30. The hardware reportedly accepts below 5degC - a commit that tried
     /// 3degC was reverted with "less than 5 min temp works, but the default is min
     /// 5 degrees" - but the panel is what a user can see and check against.
-    const ABS_MIN_HEAT_SETPOINT: i16 = 500;
-    const ABS_MAX_HEAT_SETPOINT: i16 = 3500;
+    ///
+    /// `heater.min_setpoint_celsius` and `heater.max_setpoint_celsius` in
+    /// `config.toml`. These are associated consts, which is half the reason the
+    /// configuration is resolved at build time rather than read at boot.
+    const ABS_MIN_HEAT_SETPOINT: i16 = crate::config::ABS_MIN_HEAT_SETPOINT;
+    const ABS_MAX_HEAT_SETPOINT: i16 = crate::config::ABS_MAX_HEAT_SETPOINT;
 
     const CONTROL_SEQUENCE_OF_OPERATION: ControlSequenceOfOperationEnum =
         ControlSequenceOfOperationEnum::HeatingOnly;

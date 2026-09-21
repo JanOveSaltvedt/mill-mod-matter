@@ -11,6 +11,14 @@ path = "src/main.rs"
 # No `libtest` on a bare-metal target.
 harness = false
 
+# `build.rs` turns `config.toml` into the constants `src/config.rs` exposes. Both of
+# these are already in the lock file by way of `esp-config`, so naming them here adds
+# no new crate to the graph. Host-compiled, so the crate's `no_std` rules do not reach
+# them and `build-std` does not apply.
+[build-dependencies]
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
 [dependencies]
 log = "0.4"
 

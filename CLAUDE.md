@@ -114,6 +114,12 @@ readelf -lW target/riscv32imac-unknown-none-elf/release/mill-mod-matter |
 ## Layout, and where the code came from
 
 ```
+config.toml        per-unit settings: the element's wattage, the setpoint range, the
+                   Basic Information strings, the pairing passcode/discriminator.
+                   Documented inline; `config.local.toml` (gitignored) overrides it
+                   key by key
+build.rs           parses and validates those, generates `src/config.rs` into OUT_DIR
+src/config.rs      six lines: `include!`s the generated constants
 src/main.rs        stack wiring, the `NODE` metadata, the handler chain, NVS store,
                    factory reset, the Mill UART's construction
 src/mill.rs        the wire protocol: framing, checksum, the status frame, the two
@@ -218,12 +224,39 @@ Each of these cost real investigation. None is obvious from the code.
   does - then folds two physically different boards into one record, so a bench
   board and a heater commissioned onto the same fabric collapse into one device
   while the controller still sees two nodes. `dev_det()` in `main.rs` derives both
-  strings from the factory MAC instead. The passcode, discriminator, VID/PID and
-  test DAC are still shared by every board and that is fine - none of them is what a
-  controller files a device under - though two boards advertising discriminator 3840
-  at the same time are genuinely ambiguous to a commissioner.
+  strings from the factory MAC instead, and `config.toml` now supplies the rest of the
+  block - which is also what fixed the `device_name: "MyTest"` and
+  `manufacturing_date: "20221004"` this used to inherit. The VID/PID and test DAC are
+  still shared by every board and that is fine - neither is what a controller files a
+  device under, and the VID/PID deliberately cannot be configured because the test DAC
+  is issued for them. The passcode and discriminator are shared only by default:
+  `[commissioning]` exists because two boards advertising discriminator 3840 at the
+  same time are genuinely ambiguous to a commissioner.
 - **The device is uncertified.** It ships `rs-matter`'s test DAC/PAI and the CSA test
   VID/PID, so every commissioner warns about it. Expected on a private fabric.
+
+### Configuration
+
+- **The configuration is build-time, and has to be.** `config.toml` is read by
+  `build.rs`, never by the firmware: there is no filesystem on the device, and three
+  of the values are `const` associated items that could not be runtime values anyway -
+  `ThermostatHooks::ABS_MIN/MAX_HEAT_SETPOINT` and the `ACCURACY` consts of both
+  metering hooks. Adding a key means touching four places together: the `[section]` in
+  `config.toml` (with the prose explaining it - that is where the person changing it
+  reads, not the Rust), its field in `build.rs`'s `deny_unknown_fields` struct, a rule
+  in `validate`, and the `write!` in `emit`. Do not expose `vid`/`pid`: the test DAC is
+  issued for `0xFFF1`/`0x8001` and a `BasicInformation` value that disagrees fails
+  attestation outright rather than merely warning.
+- **`heater.element_watts` does not invalidate the stored energy counter.** The blob is
+  milliwatt-*seconds* of energy already integrated, not accumulated on-time, so a
+  corrected plate rating leaves the lifetime total monotone - it just becomes two
+  segments at two rates. Had it stored on-time, every wattage change would have
+  retroactively rewritten history and needed a migration.
+- **The restored setpoint limits are clamped to the absolute range.** Narrowing
+  `heater.min/max_setpoint_celsius` on a commissioned device would otherwise leave the
+  persisted `Min/MaxHeatSetpointLimit` outside `AbsMin/AbsMaxHeatSetpointLimit`, which
+  the cluster forbids. `ThermostatDeviceLogic::new` clamps on load; the stored value is
+  not preserved.
 
 ### The Mill link
 

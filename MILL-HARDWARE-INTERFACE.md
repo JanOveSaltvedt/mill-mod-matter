@@ -330,7 +330,7 @@ Home Assistant's `integration` platform (`time_unit: h`, `restore: true`,
 `state_class: total_increasing`). Our firmware already does this natively and more
 precisely in `SimulatedHeater::integrate` / `close_period` - the KV-backed lifetime
 counter is the direct replacement for that HA helper, and needs no change beyond
-the wattage constant.
+the wattage, which is now `heater.element_watts` in `config.toml`.
 
 ## Temperature range
 
@@ -339,12 +339,14 @@ the wattage constant.
 | ESPHome visual min/max (`mill_panelheater_gen2.cpp:12-13`) | 5 °C - 35 °C |
 | Commit `3e0a203e3` "Testing min" | tried 3 °C |
 | Commit `d3888fdb4` | reverted to 5, message: *"Less than 5 min temp works, but the default is min 5 degrees"* |
-| Our current `ABS_MIN/MAX_HEAT_SETPOINT` (rs-matter defaults) | 700 / 3000 (7.00 °C / 30.00 °C) |
+| The rs-matter spec defaults | 700 / 3000 (7.00 °C / 30.00 °C) |
+| Ours, `config.toml`'s `heater.min/max_setpoint_celsius` | 5 °C - 35 °C |
 
-So the Mill itself accepts below 5 °C, but 5-35 is the range the panel offers. Our
-`AbsMin/AbsMaxHeatSetpointLimit` are `fixed`-quality consts and should be set to
-match the hardware - `500`/`3500` is the defensible choice - rather than left at the
-rs-matter spec defaults.
+So the Mill itself accepts below 5 °C, but 5-35 is the range the panel offers, and
+that is what we serve: `AbsMin/AbsMaxHeatSetpointLimit` are `fixed`-quality consts
+matching the hardware rather than the rs-matter defaults. They are configurable
+because a different panel may offer a different range - and because they are
+associated consts, which is part of why the configuration is resolved at build time.
 
 ## Known weaknesses of the ESPHome implementation
 
@@ -385,7 +387,7 @@ The current API is roughly right in *shape*; the semantics of two methods invert
 | `heating() -> bool` | unchanged shape, but now *reported* state from status byte 11, not something we set |
 | `room_temperature() -> i16` | status byte 7 × 100; must be **nullable** until the first frame arrives |
 | `tick_room() -> bool` | **gone.** Replaced by "a status frame arrived and byte 7 changed" |
-| `active_power_mw()` | `600_000` when `heating()`, else 0. Keep `ELEMENT_POWER_MW`, change the value |
+| `active_power_mw()` | the plate rating when `heating()`, else 0. Now `heater.element_watts` in `config.toml` rather than a constant in the source |
 | `active_current_ma()` | **gone**, along with the nominal supply constants. It was the plate rating divided by a 230 V that is never measured; see `meter.rs` for why no such reading is served |
 | `energy_mwh()`, `close_period()`, `integrate()`, KV persistence | **keep as is.** They only depend on `active_power_mw()`, which still works |
 | `reset_at_boot()`, `last_period()` | unchanged |
@@ -439,10 +441,11 @@ To answer on hardware, before or during the port:
 5. **Is there an ack for `0x46`/`0x47`,** or is the next `0xC9` frame the only
    confirmation? Decides whether we need retry logic.
 6. **Does the Mill accept setpoints below 5 °C and above 35 °C,** and what does it
-   clamp to? Fixes `ABS_MIN/MAX_HEAT_SETPOINT`.
+   clamp to? Fixes `heater.min/max_setpoint_celsius` in `config.toml`.
 7. **Power-on behaviour.** Does the Mill send status before we send anything, and
    does it come up in the mode it was left in?
-8. **The actual plate rating** of the unit being modded, for `ELEMENT_POWER_MW`.
-   `600` in the current YAML is a configured value, not a measurement.
+8. **The actual plate rating** of the unit being modded, for `heater.element_watts`
+   in `config.toml`. `600` in the current YAML is a configured value, not a
+   measurement, and it is the default the config file ships with.
 9. **The HF-LPT120A header pinout and rail** - pin order, 3.3 V, and whether the
    Mill can supply enough current for the C6 with the Thread radio running.
