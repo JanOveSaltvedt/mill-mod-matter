@@ -26,9 +26,21 @@ log = "0.4"
 # - `trouble`                  pure-Rust BLE host, for commissioning
 # - `openthread` + `mbedtls`   Thread transport, sharing OpenThread's mbedTLS
 # - `openthread-heap-int-8192` OpenThread's internal heap, shared with mbedTLS
-# - `events-ringbuf-size-64`   MUST be set: the default is `events-ringbuf-size-0`,
+# - `events-ringbuf-size-256`  MUST be set: the default is `events-ringbuf-size-0`,
 #                              i.e. events are silently never emitted, which would
 #                              mute Electrical Energy Measurement's two events.
+#                              The size is a *per-event* ceiling, not just a queue
+#                              depth - `EventWriter::write` fails the whole emit with
+#                              `ResourceExhausted` once one event exceeds it, and
+#                              `AddNOC` propagates that, aborting commissioning. The
+#                              `AccessControlEntryChanged` event rs-matter emits for
+#                              the admin ACL entry seeded by `AddNOC` measures 65-67
+#                              bytes with a random 64-bit operational node ID (any
+#                              real controller), so 64 was too small; it only fit
+#                              chip-tool's 3-byte node ID 112233. Our own energy
+#                              events are 45-61 bytes and grow with the running
+#                              totals and uptime. 256 buys headroom in all three
+#                              rings for 576 bytes of static RAM.
 # - `groups`                   the Groups cluster we serve on the thermostat endpoint
 rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-features = false, features = [
     "esp",
@@ -37,7 +49,7 @@ rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-f
     "openthread",
     "mbedtls",
     "openthread-heap-int-8192",
-    "events-ringbuf-size-64",
+    "events-ringbuf-size-256",
     "groups",
 ] }
 

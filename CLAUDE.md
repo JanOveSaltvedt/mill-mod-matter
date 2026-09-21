@@ -123,10 +123,22 @@ Re-exports worth knowing, so you never depend on `rs-matter` directly:
 Each of these cost real investigation. None is obvious from the code.
 
 - **Events are off by default.** `events-ringbuf-size-0` is the default in
-  `rs-matter-stack` *and* `rs-matter-embassy`. Without the
-  `events-ringbuf-size-64` feature in `Cargo.toml`, Electrical Energy Measurement's
+  `rs-matter-stack` *and* `rs-matter-embassy`. Without an `events-ringbuf-size-*`
+  feature in `Cargo.toml`, Electrical Energy Measurement's
   `CumulativeEnergyMeasured` / `PeriodicEnergyMeasured` are silently never emitted -
   no error, no warning, subscriptions just stay quiet.
+- **The event ring size is a per-event ceiling, not a queue depth.** Each of the
+  three priority rings is `N` bytes and an event that does not fit in an *empty*
+  ring fails the emit with `ResourceExhausted` (`EventWriter::write`,
+  `../rs-matter/rs-matter/src/im/events.rs`). `AddNOC` propagates that, so
+  commissioning dies right after `Added operational fabric with local index 1`
+  with nothing but `Error invoking command: ResourceExhausted`. The culprit is the
+  `AccessControlEntryChanged` event rs-matter emits for the admin ACL entry
+  `AddNOC` seeds: 65-67 bytes once the operational node ID is a random 64-bit one,
+  which every real controller assigns. `size-64` only ever worked against
+  chip-tool, whose fixed node ID 112233 encodes in three bytes. We ship
+  `events-ringbuf-size-256`; our own energy events are 45-61 bytes and grow with
+  the running totals and uptime.
 - **`VENDOR_KEYS_START` is already taken.** On a Thread device `rs-matter-embassy`
   keeps OpenThread's SRP ECDSA key at exactly `VENDOR_KEYS_START`
   (`OT_SRP_ECDSA_KEY`, `../rs-matter-embassy/rs-matter-embassy/src/ot.rs`). Ours start
