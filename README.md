@@ -15,61 +15,230 @@ Both device types share endpoint 1: Electrical Sensor is a *utility* device type
 Core spec 9.2.1 allows any number of those beside the single application one — so the
 thermostat can meter itself without a second endpoint.
 
-> **Milestone 1: the heater interface is simulated.** Commissioning, Thread, SRP, the
-> data model and NVS persistence are all real. `src/heater.rs` fakes the room
-> temperature and a 1 kW element; it is the only module that real hardware I/O
-> replaces.
+> **The Mill keeps its own control loop.** Its microcontroller owns the temperature
+> sensor, the triac and every decision about when the element is on. This board
+> replaces the heater's **WiFi module** and speaks that module's 9600-baud UART
+> protocol: it receives status frames and sends setpoint and on/off requests. The
+> Matter thermostat is therefore an advisory peer - it reports what the heater is
+> doing, including a setpoint somebody changed on the front panel, and asks for
+> changes it cannot enforce. `src/mill.rs` documents the protocol byte by byte.
+
+## Wiring
+
+| ESP32-C6 | Mill |
+| --- | --- |
+| `GPIO16` | RX of the heater's MCU (ESP → Mill) |
+| `GPIO17` | TX of the heater's MCU (Mill → ESP) |
+| GND | GND |
+
+9600 8N1, no flow control, 3.3 V TTL — the header carried an **HF-LPT120A** WiFi
+module. Pin order, the supply rail and whether the Mill can feed a C6 with the
+Thread radio running are **not** documented anywhere; confirm them against the
+physical board before wiring anything up.
+
+`GPIO16`/`GPIO17` are also the C6's default UART0 console pins, so the Mill is given
+UART1 and the log console goes out over USB Serial/JTAG. The ROM bootloader still
+says its piece on UART0 at reset, and those bytes do reach the heater's MCU, which
+makes nothing of them.
+
+`GPIO9` (Boot Mode) stays free for the factory reset.
 
 ## Prerequisites
 
 - An ESP32-C6 board (4 MB flash — see `partitions.csv` for other sizes).
-- The three sibling checkouts this crate patches in: `../rs-matter` (on branch
-  `feature/thermostat-energy-metering`), `../rs-matter-stack`, `../rs-matter-embassy`.
-- A Matter controller **with a Thread border router**: Apple TV/HomePod, a
-  screen-equipped Google Nest, Echo Hub, SmartThings hub, or IKEA Dirigera. For
-  command-line work, `chip-tool` from `../connectedhomeip` plus a separate border
-  router.
+- A Matter controller **with a Thread border router**: Home Assistant with the Matter
+  integration and a border router on the network, or a hub that is both at once - Apple
+  TV/HomePod, a screen-equipped Google Nest, Echo Hub, SmartThings hub, IKEA Dirigera.
 - `cargo install espflash`
 
 The toolchain (nightly + `rust-src` + the RISC-V target) is pinned by
-`rust-toolchain.toml` and installs itself on first build.
+`rust-toolchain.toml` and installs itself on first build. Everything else, including
+the Matter stack, comes from `Cargo.toml`; nothing has to be checked out beside this
+repository.
+
+### The Matter stack, and the fork
+
+`Cargo.toml` pins all three Matter crates to exact commits, so the build is
+reproducible and needs no sibling checkouts:
+
+| | |
+| --- | --- |
+| [`rs-matter`](https://github.com/JanOveSaltvedt/rs-matter) | **A fork**, branch `feature/thermostat-energy-metering`. It carries what this firmware is built on: the Thermostat, Electrical Power/Energy Measurement and Power Topology cluster handlers. A PR to [`project-chip/rs-matter`](https://github.com/project-chip/rs-matter) is open; when it lands, these entries move back to the upstream repository and nothing else here changes. |
+| [`rs-matter-stack`](https://github.com/ivmarkov/rs-matter-stack) | Unmodified upstream. |
+| [`rs-matter-embassy`](https://github.com/ivmarkov/rs-matter-embassy) | Unmodified upstream. |
+
+`rs-matter` and `rs-matter-stack` sit in `[patch.crates-io]` rather than in
+`[dependencies]`, since nothing here names either of them directly: `rs-matter-embassy`
+resolves both from crates.io, and the patch is what puts the fork underneath it.
+Pinning commits rather than released versions keeps the dependency graph identical to
+the one this was built and tested against.
+
+Each of the three has a commented-out `path = "../..."` line beside it in
+`Cargo.toml`. Uncommenting those (and commenting out the `git` lines) builds against
+sibling checkouts in the same parent directory instead, which is how the fork itself
+is developed. The `esp-*` crates are pinned the same way, to the single git revision
+`rs-matter-embassy`'s own examples use — they must all come from one revision or the
+peripheral singletons stop matching.
+
+## Configuration
+
+Per-unit settings live in **`config.toml`** at the repo root, which documents every key
+inline. `build.rs` validates the file and generates `src/config.rs` from it — and the
+pairing codes under `commissioning/` — so a bad value fails the build with a sentence
+instead of reaching a board.
+
+It is resolved at build time, not read at boot: there is no filesystem on the device,
+and several of the values land in `const` contexts that a runtime value could not
+satisfy.
+
+To change something, either edit `config.toml`, or - better, since it keeps your tree
+clean - put just the keys you want in **`config.local.toml`**, which is gitignored and
+merged over the defaults key by key:
+
+```toml
+[heater]
+element_watts = 1200
+```
+
+Then `cargo build --release` and reflash. Touching either file re-runs the generator.
+
+### The one key to get right
+
+**`heater.element_watts`.** There is no metering hardware in the Mill and the mod did
+not add any, so every reading the Electrical Power and Electrical Energy Measurement
+clusters serve is this number gated on one bit of the Mill's status frame. Get it wrong
+and the power reading is wrong and the lifetime energy total is wrong by the same
+factor. Read it off the plate on the back of the heater - Mill ships the same Gen 2
+panel from roughly 250 W to 2000 W, and the default here is the 600 W unit this was
+developed against.
+
+Changing it later is safe and needs no migration: the persisted counter holds
+milliwatt-*seconds* of energy already integrated, not accumulated on-time, so the
+lifetime total stays monotone. It simply becomes a sum of two segments computed at two
+rates, which is the honest answer for a device whose plate rating was corrected.
+
+### The rest
+
+| Section | Keys |
+| --- | --- |
+| `[heater]` | `element_watts`, the setpoint range (`min`/`max`/`default_setpoint_celsius`), `metering_accuracy_percent`, `circuit_max_watts` |
+| `[device]` | The Matter Basic Information strings: vendor and product name, product label, part number, hardware and software version (and their strings), manufacturing date, the mDNS `device_name`, an optional `serial_number` override, and the `unique_id_prefix` |
+| `[commissioning]` | `passcode` and `discriminator`, which are what the printed QR and manual pairing codes encode |
+
+Three notes:
+
+- **Leave `serial_number` empty.** Empty means each board derives its own from the
+  chip's factory MAC, which is what you want: a controller that files devices under the
+  serial number as well as the node ID - Home Assistant does - folds two boards sharing
+  one serial into a single device record, so setting it in a shared config file costs
+  you exactly that. The `UniqueID` is always MAC-derived and never follows an explicit
+  serial.
+- **Give a second board its own `discriminator`.** Two boards advertising 3840 at once
+  are genuinely ambiguous to a commissioner. This is the one shared commissioning
+  parameter that actually causes trouble.
+- **Narrowing the setpoint range** on an already-commissioned device clamps the stored
+  `Min`/`MaxHeatSetpointLimit` into the new band on the next boot rather than preserving
+  them, since the cluster does not allow them outside `AbsMin`/`AbsMaxHeatSetpointLimit`.
+
+### What is deliberately *not* configurable
+
+| | Why |
+| --- | --- |
+| `vendor_id` / `product_id` | The test DAC/PAI is issued for the CSA test VID/PID `0xFFF1`/`0x8001`. A `BasicInformation` value disagreeing with the certificate fails device attestation outright rather than merely warning. Configurable only alongside a real DAC. |
+| The wire protocol in `src/mill.rs` | Opcodes, byte offsets, command templates and the checksum. A different protocol is a code change; the compile-time wire fixtures in that file exist to make a mismatch a build error. |
+| The 9600 baud rate | Fixed by the Mill, not a choice. |
+| UART pins and the factory-reset GPIO | Dictated by the HF-LPT120A header and the C6's Boot Mode pin. |
+| `BUMP_SIZE`, `HEAP_SIZE` | Tuned; too small panics during stack init. |
+| Sampling, persist and watchdog intervals | Internal cadence. Lowering the energy persist interval puts a flash write that stalls the radio back on the sampling path. |
+| Voltage, current, frequency, power factor | Not served at all, deliberately. There is nothing to measure them with, and a client cannot tell a derived reading from a measured one. |
 
 ## Build and flash
 
 ```sh
 cargo build --release
 
-espflash flash --monitor --partition-table partitions.csv --baud 1500000 \
+espflash flash --monitor \
     target/riscv32imac-unknown-none-elf/release/mill-mod-matter
 ```
 
-`cargo run --release` does the same, via the runner in `.cargo/config.toml`.
+`cargo run --release` does the same, via the runner in `.cargo/config.toml`. The
+partition table and the flashing baud rate come from `espflash.toml`, so run espflash
+from the project root - a board flashed with espflash's own default table gets a 24 KiB
+`nvs` instead of 64 KiB and comes up with a silently truncated store.
 
 ## Commissioning
 
-While the device has no fabrics, it opens a commissioning window on boot and prints
-a QR code plus a manual pairing code. Scan it from your controller's phone app. It will warn that the device is uncertified — it ships
-`rs-matter`'s test attestation and the CSA test VID/PID, which is expected on a
-private fabric.
+While the device has no fabrics, it opens a commissioning window on boot and prints a
+QR code plus a manual pairing code on the console. Scan or type it into your
+controller's app. It will warn that the device is uncertified — it ships `rs-matter`'s
+test attestation and the CSA test VID/PID, which is expected on a private fabric.
 
-Once commissioned, the monitor shows the simulation running: `Heater: heating ON/OFF`
-as the hysteresis band opens and closes the relay, and a simulated front-panel press
-nudging the setpoint once a minute.
+A console is not actually required to get those codes, which matters: a heater is
+usually closed up before it is ever commissioned. Nothing in them is generated at
+runtime — they are the `[commissioning]` passcode and discriminator from `config.toml`,
+plus the fixed test VID/PID, the standard commissioning flow and BLE as the only
+discovery capability, since the device commissions over BLE before it has joined
+Thread. So the build produces them, into **`commissioning/`**:
 
-## Poking at it with chip-tool
+| | |
+| --- | --- |
+| `commissioning/qr.svg` | The QR code as a scalable image, 40 mm square at its natural size. This is the one to print or open in a browser. |
+| `commissioning/pairing.txt` | The `MT:...` payload, the manual pairing code, the parameters behind both, and the same block art the console shows. |
 
-```sh
-chip-tool thermostat read occupied-heating-setpoint <node-id> 1
-chip-tool thermostat write system-mode 4 <node-id> 1          # 4 = Heat
-chip-tool thermostat subscribe local-temperature 1 10 <node-id> 1
-chip-tool thermostat setpoint-raise-lower 0 10 <node-id> 1    # +5.0 C
+Both are written by `build.rs` on every `cargo build`, are regenerated when
+`config.toml` or `config.local.toml` changes, and are gitignored — on a tree with a
+`config.local.toml` they are the codes of one particular board. `build.rs` encodes
+them with `rs-matter`'s own `pairing::qr`, the code the firmware runs, so the two
+cannot drift apart. (That is the second, host-side build of `rs-matter` in the
+dependency graph, and roughly a minute on a clean tree.)
 
-chip-tool electricalpowermeasurement read active-power <node-id> 1
-chip-tool electricalenergymeasurement read cumulative-energy-imported <node-id> 1
-chip-tool electricalenergymeasurement subscribe-event cumulative-energy-measured 1 10 <node-id> 1
-```
+The manual code is byte-for-byte what the board prints, modulo the `XXXX-XXX-XXXX`
+grouping it uses for reading aloud. The QR payload differs from the board's in exactly
+one field: `rs-matter` folds `SerialNumber` into the payload as optional TLV data, and
+each board derives its own from the chip's factory MAC, which a build cannot know. A
+commissioner does not need that field — both codes carry the same discriminator and
+passcode — so both pair. Only the strings differ.
 
-`active-power` reads `1000000` (mW) while the relay is closed and `0` otherwise.
+Once commissioned, the monitor shows the link to the heater: the first few status
+frames raw (`Mill: RX 5A ...`, with the gap since the previous one), then
+`Mill: element ON/OFF` as the Mill's own control loop works, and
+`Thermostat: the heater's setpoint moved to 22C on its own` when somebody turns the
+knob on the front panel. Writes go the other way as `Mill: requesting ...`.
+
+If the log instead fills with `Mill: dropping malformed frame`, the raw bytes are in
+the warning: either the wiring is wrong or the Mill computes its checksum
+differently from `src/mill.rs`. If nothing arrives at all, `LocalTemperature` reads
+null and `Mill: no status frame for 120 s` appears once.
+
+## Home Assistant
+
+Add it from **Settings → Devices & services → Add integration → Matter**, then scan the
+QR code or type the manual pairing code. Home Assistant needs a Thread border router it
+can reach; the device itself needs nothing further.
+
+What shows up:
+
+- A **climate entity** in `heat` mode, carrying the heating setpoint and the room
+  temperature the Mill reports. Changing the setpoint there sends it to the Mill, which
+  is free to round it to a whole degree or ignore it outright; the entity settles on
+  whatever the next status frame says. A setpoint changed on the heater's own front
+  panel arrives by the same path and shows up unprompted.
+- **Power and energy sensors** from the Electrical Power and Electrical Energy
+  Measurement clusters. The lifetime energy counter is persisted in flash and is
+  monotone across reboots and firmware updates, which is what the Energy dashboard
+  wants from an individual device.
+
+Two things worth knowing about those readings. Active power is the element's plate
+rating (`heater.element_watts`) gated on one bit of the Mill's status frame — full
+rating while the element is on, zero while it is off. There is no metering hardware in
+the heater and the mod did not add any, so that number is worth checking against the
+plate on the unit being modded.
+
+For the same reason it is the *only* power reading served: no voltage, current,
+frequency, power factor or RMS, apparent and reactive quantities. Those are all
+optional in the cluster, and serving them would mean deriving them from a nominal
+230 V / 50 Hz supply that this board never measures — a client has no way to tell
+such a reading from a measured one.
 
 ## Persistence and factory reset
 
@@ -85,9 +254,13 @@ from your controller as well, or it will keep trying to reach the old fabric.
 
 ## Documentation
 
-`CLAUDE.md` carries the working notes: the four-repository layout and why the
-`[patch.crates-io]` entries exist, where each part of `main.rs` was ported from, and a
-list of non-obvious gotchas in this corner of the Matter stack.
+`src/mill.rs` is the protocol reference: the framing, the status frame's offsets and
+the two command frames, with worked examples asserted at compile time.
+
+`CLAUDE.md` carries the working notes: the sibling-checkout layout the fork is
+developed in and why the `[patch.crates-io]` entries exist, where each part of
+`main.rs` was ported from, and a list of non-obvious gotchas in this corner of the
+Matter stack.
 
 ## Licence
 

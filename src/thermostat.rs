@@ -1,9 +1,35 @@
-//! The Thermostat cluster's device-specific half: a heating-only thermostat whose
-//! four non-volatile attributes live in the Matter KV store.
+//! The Thermostat cluster's device-specific half.
+//!
+//! There is no control loop here, and that is the whole shape of this module: the
+//! Mill's own microcontroller owns the sensor, the triac and the hysteresis, so
+//! the cluster is a *view* of that controller plus a way to make requests of it.
+//!
+//! - A write to `SystemMode` or `OccupiedHeatingSetpoint` arrives as
+//!   [`ThermostatHooks::apply`] and is turned into a Mill command frame.
+//! - Everything the attributes report - the local temperature, the running state,
+//!   and the setpoint and mode the Mill actually settled on - comes back from the
+//!   status stream in [`MillHeater::recv_status`].
+//!
+//! Two consequences worth stating plainly, because they are visible over Matter:
+//!
+//! **The Mill wins.** A setpoint or mode that arrives from the heater and was not
+//! asked for is a front-panel change, and is adopted into the cluster attributes
+//! and reported with `SetpointChangeSource = Manual` - section 4.3.11.30 exists
+//! for exactly this. That includes the first status frame after boot: the
+//! persisted attributes are what the device came up with, but the Mill is what
+//! the device *is*.
+//!
+//! **Whole degrees.** Matter is 0.01degC and the wire is 1degC, so a written
+//! setpoint is rounded to the nearest whole degree as it is stored, and a
+//! controller that writes 21.50degC reads back 22.00degC. Rounding at the write
+//! rather than in the command frame keeps the attribute honest about what the
+//! hardware was actually asked for.
 
 use core::cell::Cell;
 
-use log::{error, info};
+use embassy_futures::select::{select, Either};
+
+use log::{error, info, warn};
 
 use rs_matter_embassy::matter::dm::clusters::app::thermostat::{
     ControlSequenceOfOperationEnum, OutOfBandMessage, RelayStateBitmap, SystemModeEnum,
@@ -15,18 +41,23 @@ use rs_matter_embassy::matter::error::Error;
 use rs_matter_embassy::matter::tlv::Nullable;
 use rs_matter_embassy::matter::with;
 
-use crate::heater::{SimulatedHeater, HEATING_RATE, TICK};
+use crate::heater::{Changed, MillHeater, STATUS_TIMEOUT};
 use crate::vendor_kv::{VendorKv, THERMOSTAT_STATE_KEY};
 
-/// The setpoint a device with nothing to restore comes up with: 20.00degC.
-const DEFAULT_HEATING_SETPOINT: i16 = 2000;
+/// The setpoint a device with nothing to restore comes up with. It only ever reaches
+/// the wire if the Mill never says otherwise.
+///
+/// `heater.default_setpoint_celsius` in `config.toml`.
+const DEFAULT_HEATING_SETPOINT: i16 = crate::config::DEFAULT_HEATING_SETPOINT;
 
-/// How far the simulated front panel moves the setpoint per press: half a degree.
-const FRONT_PANEL_STEP: i16 = 50;
-
-/// How many [`TICK`]s between simulated front-panel presses. At a 5 s tick, once a
-/// minute.
-const FRONT_PANEL_TICKS: u32 = 12;
+/// How long a command frame is given to show up in the status stream before the
+/// Mill's own report is believed over it.
+///
+/// Commands are fire-and-forget - no ack, no sequence number - so the only
+/// confirmation is the next status frame carrying the value back. Until this
+/// expires, a status frame that disagrees is assumed to have crossed the command
+/// on the wire rather than to have overruled it.
+const COMMAND_GRACE_MS: u64 = 15_000;
 
 /// The four non-volatile attributes, as they are laid out in the KV store:
 /// `SystemMode` as one byte, then `OccupiedHeatingSetpoint`,
@@ -85,23 +116,30 @@ impl Default for PersistentState {
     }
 }
 
-/// A heating-only thermostat driving [`SimulatedHeater`].
+/// A heating-only thermostat that fronts a [`MillHeater`].
 pub struct ThermostatDeviceLogic<'a> {
     occupied_heating_setpoint: Cell<i16>,
     min_heat_setpoint_limit: Cell<i16>,
     max_heat_setpoint_limit: Cell<i16>,
     system_mode: Cell<SystemModeEnum>,
-    /// Counts `run` ticks, so the simulated front panel can nudge the setpoint
-    /// once in a while.
-    ticks: Cell<u32>,
-    /// The load this thermostat switches. Its relay flag is the thermostat's
-    /// output and the meters' input.
-    heater: &'a SimulatedHeater<'a>,
+    /// Whether [`ThermostatHooks::apply`] has been called at all. The handler
+    /// calls it once at startup, before anything can have been written and before
+    /// the Mill has been heard from; that call must not push the restored state
+    /// onto a heater that may have been turned up by hand in the meantime.
+    applied: Cell<bool>,
+    /// A setpoint command in whole degC awaiting confirmation, and when it was
+    /// sent in milliseconds since boot.
+    pending_setpoint: Cell<Option<(u8, u64)>>,
+    /// A power command awaiting confirmation, likewise.
+    pending_mode: Cell<Option<(bool, u64)>>,
+    /// The heater this thermostat advises, and the source of every reading it
+    /// reports.
+    heater: &'a MillHeater<'a>,
     kv: &'a dyn VendorKv,
 }
 
 impl<'a> ThermostatDeviceLogic<'a> {
-    pub fn new(kv: &'a dyn VendorKv, heater: &'a SimulatedHeater<'a>) -> Self {
+    pub fn new(kv: &'a dyn VendorKv, heater: &'a MillHeater<'a>) -> Self {
         let mut buf = [0u8; PersistentState::LEN];
 
         let state = match kv.load_blob(THERMOSTAT_STATE_KEY, &mut buf) {
@@ -109,12 +147,27 @@ impl<'a> ThermostatDeviceLogic<'a> {
             _ => PersistentState::default(),
         };
 
+        // The restored limits are clamped into the absolute range, and the setpoint
+        // into the result. The blob predates the running firmware, so a narrower
+        // `heater.min/max_setpoint_celsius` in `config.toml` would otherwise leave
+        // `Min/MaxHeatSetpointLimit` outside `AbsMin/AbsMaxHeatSetpointLimit`, which
+        // the cluster does not allow - and it costs nothing to be robust against a
+        // corrupt blob at the same time.
+        let min = state
+            .min_heat_setpoint_limit
+            .clamp(Self::ABS_MIN_HEAT_SETPOINT, Self::ABS_MAX_HEAT_SETPOINT);
+        let max = state
+            .max_heat_setpoint_limit
+            .clamp(min, Self::ABS_MAX_HEAT_SETPOINT);
+
         Self {
-            occupied_heating_setpoint: Cell::new(state.occupied_heating_setpoint),
-            min_heat_setpoint_limit: Cell::new(state.min_heat_setpoint_limit),
-            max_heat_setpoint_limit: Cell::new(state.max_heat_setpoint_limit),
+            occupied_heating_setpoint: Cell::new(state.occupied_heating_setpoint.clamp(min, max)),
+            min_heat_setpoint_limit: Cell::new(min),
+            max_heat_setpoint_limit: Cell::new(max),
             system_mode: Cell::new(state.system_mode),
-            ticks: Cell::new(0),
+            applied: Cell::new(false),
+            pending_setpoint: Cell::new(None),
+            pending_mode: Cell::new(None),
             heater,
             kv,
         }
@@ -133,50 +186,195 @@ impl<'a> ThermostatDeviceLogic<'a> {
         }
     }
 
-    /// Move the heating setpoint, the way a press of the front-panel up/down
-    /// buttons would, bouncing off the configured limits.
+    /// Snap a setpoint in 0.01degC to the whole degree the wire can carry,
+    /// keeping it inside the configured limits.
     ///
-    /// Because this happens behind the cluster's back, the handler attributes it to
-    /// `Manual` rather than `External` - the whole point of `SetpointChangeSource`.
-    fn nudge_setpoint(&self) {
-        let previous = self.occupied_heating_setpoint.get();
-        let max = self.max_heat_setpoint_limit.get();
+    /// Rounding is to the nearest degree, except where that would leave the
+    /// `MinHeatSetpointLimit`/`MaxHeatSetpointLimit` band, in which case it goes
+    /// the other way - a written setpoint must not come back out of range. A band
+    /// narrower than one degree has no whole degree in it at all; then the limit
+    /// wins and the command frame carries the rounding of that.
+    fn quantize(&self, value: i16) -> i16 {
         let min = self.min_heat_setpoint_limit.get();
+        let max = self.max_heat_setpoint_limit.get();
 
-        let next = if previous.saturating_add(FRONT_PANEL_STEP) > max {
-            min
-        } else {
-            previous.saturating_add(FRONT_PANEL_STEP)
+        let mut snapped = i16::from(whole_degrees(value)) * 100;
+
+        if snapped > max {
+            snapped -= 100;
+        }
+
+        if snapped < min {
+            snapped += 100;
+        }
+
+        snapped.clamp(min, max)
+    }
+
+    /// Send whatever the Mill is not already doing.
+    ///
+    /// Suppressing a command the heater already agrees with keeps a busy controller
+    /// from filling the UART with no-ops, but an *outstanding* command always
+    /// wins over what the heater last reported: it may not have been taken up yet.
+    fn command(&self, system_mode: SystemModeEnum, heating_setpoint: i16) {
+        let now = embassy_time::Instant::now().as_millis();
+
+        let setpoint_c = whole_degrees(heating_setpoint);
+
+        let agreed = match self.pending_setpoint.get() {
+            Some((pending, _)) => pending == setpoint_c,
+            None => self.heater.reported_setpoint() == Some(i16::from(setpoint_c) * 100),
         };
 
-        self.occupied_heating_setpoint.set(next);
-        self.save_state();
-        self.update_relay();
+        if !agreed {
+            self.heater.request_setpoint(setpoint_c);
+            self.pending_setpoint.set(Some((setpoint_c, now)));
+        }
 
-        info!(
-            "Thermostat: front panel moved the heating setpoint {}.{:02}C -> {}.{:02}C",
-            previous / 100,
-            (previous % 100).abs(),
-            next / 100,
-            (next % 100).abs()
-        );
+        let heat = matches!(system_mode, SystemModeEnum::Heat);
+
+        let agreed = match self.pending_mode.get() {
+            Some((pending, _)) => pending == heat,
+            None => self.heater.reported_heat_mode() == Some(heat),
+        };
+
+        if !agreed {
+            self.heater.request_power(heat);
+            self.pending_mode.set(Some((heat, now)));
+        }
     }
 
-    /// Re-evaluate the heat demand, with a one-notch hysteresis band around the
-    /// setpoint so the relay does not chatter every tick.
-    fn update_relay(&self) {
-        let setpoint = self.occupied_heating_setpoint.get();
-        let temperature = self.heater.room_temperature();
+    /// Adopt the setpoint the Mill reports, unless a command of ours is still in
+    /// flight.
+    fn sync_setpoint<F: Fn(OutOfBandMessage)>(&self, notify: &F) {
+        let Some(reported) = self.heater.reported_setpoint() else {
+            return;
+        };
 
-        let heating = matches!(self.system_mode.get(), SystemModeEnum::Heat)
-            && if self.heater.heating() {
-                temperature < setpoint.saturating_add(HEATING_RATE)
+        let reported_c = whole_degrees(reported);
+
+        if let Some((pending, sent_ms)) = self.pending_setpoint.get() {
+            if pending == reported_c {
+                self.pending_setpoint.set(None);
+            } else if elapsed_ms(sent_ms) < COMMAND_GRACE_MS {
+                // Sent, not yet reflected: this frame was already on its way.
+                return;
             } else {
-                temperature < setpoint.saturating_sub(HEATING_RATE)
-            };
+                warn!("Thermostat: the Mill did not take up {pending}C; it reports {reported_c}C");
+                self.pending_setpoint.set(None);
+            }
+        }
 
-        self.heater.set_heating(heating);
+        let value = self.quantize(reported);
+
+        // This runs on every status frame, so everything below it has to be
+        // conditional on the attribute actually moving - otherwise a steady heater
+        // would log a line a second.
+        if value == self.occupied_heating_setpoint.get() {
+            return;
+        }
+
+        info!("Thermostat: the heater's setpoint moved to {reported_c}C on its own");
+
+        if value != reported {
+            // The heater is set to something the cluster has promised a controller
+            // it will not report. The limits win - a value outside them would be
+            // a conformance failure - so the log is where the truth goes.
+            warn!(
+                "Thermostat: {reported_c}C is outside the configured \
+                 {}.{:02}C-{}.{:02}C band; reporting {}.{:02}C instead",
+                self.min_heat_setpoint_limit.get() / 100,
+                (self.min_heat_setpoint_limit.get() % 100).abs(),
+                self.max_heat_setpoint_limit.get() / 100,
+                (self.max_heat_setpoint_limit.get() % 100).abs(),
+                value / 100,
+                (value % 100).abs(),
+            );
+        }
+
+        self.occupied_heating_setpoint.set(value);
+        self.save_state();
+
+        // Behind the cluster's back, so the handler records this as `Manual` -
+        // which is precisely what a turn of the knob on the front panel is.
+        notify(OutOfBandMessage::OccupiedHeatingSetpoint);
     }
+
+    /// Adopt the power state the Mill reports, unless a command of ours is still
+    /// in flight.
+    fn sync_mode<F: Fn(OutOfBandMessage)>(&self, notify: &F) {
+        let Some(reported) = self.heater.reported_heat_mode() else {
+            return;
+        };
+
+        if let Some((pending, sent_ms)) = self.pending_mode.get() {
+            if pending == reported {
+                self.pending_mode.set(None);
+            } else if elapsed_ms(sent_ms) < COMMAND_GRACE_MS {
+                return;
+            } else {
+                warn!(
+                    "Thermostat: the Mill did not take up power {}; it reports {}",
+                    if pending { "ON" } else { "OFF" },
+                    if reported { "ON" } else { "OFF" }
+                );
+                self.pending_mode.set(None);
+            }
+        }
+
+        let mode = if reported {
+            SystemModeEnum::Heat
+        } else {
+            SystemModeEnum::Off
+        };
+
+        if mode as u8 == self.system_mode.get() as u8 {
+            return;
+        }
+
+        info!("Thermostat: the heater's power state changed to {mode:?} on its own");
+
+        self.system_mode.set(mode);
+        self.save_state();
+
+        notify(OutOfBandMessage::SystemMode);
+    }
+
+    /// Re-report whatever a status frame - or the silence that expired one -
+    /// moved.
+    fn report<F: Fn(OutOfBandMessage)>(&self, changed: Changed, notify: &F) {
+        if changed.room {
+            notify(OutOfBandMessage::LocalTemperature);
+        }
+
+        // The Mill's control loop moves the element with nobody having written
+        // anything, so this is a relay transition the handler cannot see for
+        // itself.
+        if changed.element {
+            notify(OutOfBandMessage::RunningState);
+        }
+
+        // Unconditionally, not only when this frame moved them: a command the
+        // Mill never took up shows as a *disagreement* that persists across
+        // frames, and nothing else would ever notice it.
+        self.sync_setpoint(notify);
+        self.sync_mode(notify);
+    }
+}
+
+/// Round a temperature in 0.01degC to the whole degrees the Mill's wire format
+/// carries.
+fn whole_degrees(centi: i16) -> u8 {
+    // Half away from zero. Every setpoint that reaches here is inside
+    // `ABS_MIN_HEAT_SETPOINT..=ABS_MAX_HEAT_SETPOINT`, so the clamp is belt and
+    // braces against a reading that never arrives.
+    ((i32::from(centi) + 50).div_euclid(100)).clamp(0, i32::from(u8::MAX)) as u8
+}
+
+fn elapsed_ms(since_ms: u64) -> u64 {
+    embassy_time::Instant::now()
+        .as_millis()
+        .saturating_sub(since_ms)
 }
 
 impl ThermostatHooks for ThermostatDeviceLogic<'_> {
@@ -206,6 +404,17 @@ impl ThermostatHooks for ThermostatDeviceLogic<'_> {
         .with_cmds(with!(thermostat_cluster::CommandId::SetpointRaiseLower))
         .with_events(with!());
 
+    /// The range the Mill's own front panel offers, 5-35, rather than the
+    /// rs-matter spec defaults of 7-30. The hardware itself reportedly accepts
+    /// setpoints below 5degC, but the panel is what a user can see and check
+    /// against.
+    ///
+    /// `heater.min_setpoint_celsius` and `heater.max_setpoint_celsius` in
+    /// `config.toml`. These are associated consts, which is half the reason the
+    /// configuration is resolved at build time rather than read at boot.
+    const ABS_MIN_HEAT_SETPOINT: i16 = crate::config::ABS_MIN_HEAT_SETPOINT;
+    const ABS_MAX_HEAT_SETPOINT: i16 = crate::config::ABS_MAX_HEAT_SETPOINT;
+
     const CONTROL_SEQUENCE_OF_OPERATION: ControlSequenceOfOperationEnum =
         ControlSequenceOfOperationEnum::HeatingOnly;
 
@@ -213,16 +422,20 @@ impl ThermostatHooks for ThermostatDeviceLogic<'_> {
     // its own, so `SetpointChangeSourceTimestamp` is stamped from the node's
     // Last-Known-Good UTC time, which the handler reads for itself.
 
+    /// Null until the Mill has been heard from, and null again if it goes quiet.
+    /// There is no sensor on this side of the UART to fall back on.
     fn local_temperature(&self) -> Nullable<i16> {
-        Nullable::some(self.heater.room_temperature())
+        Nullable::new(self.heater.room_temperature())
     }
 
     fn occupied_heating_setpoint(&self) -> i16 {
         self.occupied_heating_setpoint.get()
     }
 
+    /// Stored at the resolution the hardware can actually hold, so that what a
+    /// controller reads back is what the heater was asked for.
     fn set_occupied_heating_setpoint(&self, value: i16) -> Result<(), Error> {
-        self.occupied_heating_setpoint.set(value);
+        self.occupied_heating_setpoint.set(self.quantize(value));
         self.save_state();
 
         Ok(())
@@ -261,9 +474,9 @@ impl ThermostatHooks for ThermostatDeviceLogic<'_> {
         Ok(())
     }
 
-    /// The heater is a single-stage heater with no fan, so the only relay it can ever
-    /// have energised is `Heat` - and the element the metering clusters watch *is*
-    /// the relay, so it can answer for itself.
+    /// The heater is a single-stage heater with no fan, so the only relay it can
+    /// ever have energised is `Heat` - and it is the Mill that energises it, so
+    /// this is a report and not a command.
     fn running_state(&self) -> RelayStateBitmap {
         if self.heater.heating() {
             RelayStateBitmap::HEAT
@@ -275,54 +488,45 @@ impl ThermostatHooks for ThermostatDeviceLogic<'_> {
     /// A heating-only device: the cooling setpoint is whatever the hook default
     /// returns, and means nothing here.
     fn apply(&self, system_mode: SystemModeEnum, heating_setpoint: i16, _cooling_setpoint: i16) {
+        if !self.applied.replace(true) {
+            // The startup call. Nothing has been written yet and the Mill has not
+            // been heard from, so there is nothing to push - and pushing the
+            // restored state would overwrite a setpoint somebody turned up by
+            // hand while this board was rebooting.
+            info!(
+                "Thermostat: restored {system_mode:?} at {}.{:02}C; waiting for the Mill to report",
+                heating_setpoint / 100,
+                (heating_setpoint % 100).abs(),
+            );
+
+            return;
+        }
+
         info!(
-            "Thermostat: system mode {:?}, heating setpoint {}.{:02}C, room {}.{:02}C",
-            system_mode,
+            "Thermostat: {system_mode:?}, heating setpoint {}.{:02}C",
             heating_setpoint / 100,
             (heating_setpoint % 100).abs(),
-            self.heater.room_temperature() / 100,
-            (self.heater.room_temperature() % 100).abs(),
         );
 
-        // Re-evaluate the relay immediately rather than waiting a tick, so that
-        // switching to `Heat` has a visible effect right away.
-        self.update_relay();
+        self.command(system_mode, heating_setpoint);
     }
 
     async fn run<F: Fn(OutOfBandMessage)>(&self, notify: F) {
         loop {
-            // In a real device we would wait on a temperature sensor rather than
-            // poll a simulation.
-            embassy_time::Timer::after(TICK).await;
-
-            let heating = self.heater.heating();
-
-            // Stand in for somebody pressing the buttons on the heater's front panel,
-            // so the `Manual` half of section 4.3.11.30 is visible on a running
-            // device. A real device would do this from its own input handling.
-            let ticks = self.ticks.get().wrapping_add(1);
-            self.ticks.set(ticks);
-
-            if ticks.is_multiple_of(FRONT_PANEL_TICKS) {
-                self.nudge_setpoint();
-                notify(OutOfBandMessage::OccupiedHeatingSetpoint);
-            }
-
-            let room_changed = self.heater.tick_room();
-
-            // Re-evaluate the relay whether or not the room moved: the hysteresis
-            // band is relative to the setpoint, which may have moved instead.
-            self.update_relay();
-
-            if room_changed {
-                notify(OutOfBandMessage::LocalTemperature);
-            }
-
-            // The hysteresis band can move the relay with nobody having written
-            // anything, so this is the one relay transition the handler cannot see
-            // for itself.
-            if self.heater.heating() != heating {
-                notify(OutOfBandMessage::RunningState);
+            // The timer restarts with every frame, so it is a watchdog on the
+            // Mill rather than a poll: the heater pushes status unprompted and
+            // nothing here ever asks for it.
+            match select(
+                self.heater.recv_status(),
+                embassy_time::Timer::after(STATUS_TIMEOUT),
+            )
+            .await
+            {
+                Either::First(changed) => self.report(changed, &notify),
+                // The setpoint and mode attributes deliberately keep their last
+                // values here: they are cluster state that SHALL survive a reboot,
+                // not sensor readings that can go null.
+                Either::Second(()) => self.report(self.heater.forget(), &notify),
             }
         }
     }

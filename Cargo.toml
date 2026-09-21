@@ -11,6 +11,28 @@ path = "src/main.rs"
 # No `libtest` on a bare-metal target.
 harness = false
 
+# `build.rs` turns `config.toml` into the constants `src/config.rs` exposes, and into
+# the onboarding artifacts under `commissioning/`. Host-compiled, so the crate's
+# `no_std` rules do not reach them and `build-std` does not apply.
+#
+# `toml` and `serde` are already in the lock file by way of `esp-config`, so naming
+# them here adds no new crate to the graph.
+#
+# `rs-matter` does: this is a *second*, host-targeted build of it, on top of the one
+# the firmware links. It is what makes the generated QR payload the same code path the
+# device runs rather than a re-implementation of the Core spec's bit packing - so the
+# two cannot drift. `default-features = false` drops the crypto backend, the OS
+# transports and the logging facade, none of which `pairing::qr` needs, and leaves a
+# build of roughly a minute that only a clean tree or a `Cargo.toml` change pays.
+[build-dependencies]
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+#
+# Our fork, pinned to the exact commit the firmware links (see `[patch.crates-io]`
+# below). Uncomment the `path` line instead to develop against the sibling checkout.
+rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c22fbe4a2fdc9a51c714281000f21f4224e82702", default-features = false }
+# rs-matter = { path = "../rs-matter/rs-matter", default-features = false }
+
 [dependencies]
 log = "0.4"
 
@@ -25,19 +47,7 @@ log = "0.4"
 # - `esp`                      esp-hal/esp-radio flavoured drivers (`EspThreadDriver`)
 # - `trouble`                  pure-Rust BLE host, for commissioning
 # - `openthread` + `mbedtls`   Thread transport, sharing OpenThread's mbedTLS
-# - `openthread-ftd`           build OpenThread as a Full Thread Device, so this
-#                              mains-powered node routes for the mesh instead of
-#                              hanging off a parent as an End Device. Links
-#                              `libopenthread-ftd.a` in place of the MTD archive and
-#                              unlocks the real route table plus the REED refinement
-#                              in `rs-matter-embassy`'s `ThreadDiag`. Note this is
-#                              safe to enable on an already-commissioned device only
-#                              because `rs-matter-embassy` keeps OpenThread's
-#                              settings in RAM (all but the SRP ECDSA key): an FTD
-#                              build restores a persisted device mode verbatim
-#                              (`Mle::Restore`), so a node that had stored its MTD
-#                              mode would silently stay an End Device.
-# - `openthread-heap-int-*`    OpenThread's internal heap, shared with mbedTLS
+# - `openthread-heap-int-8192` OpenThread's internal heap, shared with mbedTLS
 # - `events-ringbuf-size-256`  MUST be set: the default is `events-ringbuf-size-0`,
 #                              i.e. events are silently never emitted, which would
 #                              mute Electrical Energy Measurement's two events.
@@ -47,21 +57,24 @@ log = "0.4"
 #                              `AddNOC` propagates that, aborting commissioning. The
 #                              `AccessControlEntryChanged` event rs-matter emits for
 #                              the admin ACL entry seeded by `AddNOC` measures 65-67
-#                              bytes with a random 64-bit operational node ID (any
-#                              real controller), so 64 was too small; it only fit
-#                              chip-tool's 3-byte node ID 112233. Our own energy
-#                              events are 45-61 bytes and grow with the running
-#                              totals and uptime. 256 buys headroom in all three
-#                              rings for 576 bytes of static RAM.
+#                              bytes with a random 64-bit operational node ID, which
+#                              is what any real controller assigns - so nothing below
+#                              `size-128` can carry it. Our own energy events are
+#                              45-61 bytes and grow with the running totals and
+#                              uptime. 256 buys headroom in all three rings for 576
+#                              bytes of static RAM.
 # - `groups`                   the Groups cluster we serve on the thermostat endpoint
-rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-features = false, features = [
+#
+# Unmodified upstream, pinned to a commit. To develop against the sibling checkout,
+# swap the next two lines; the feature list below is shared either way.
+# rs-matter-embassy = { path = "../rs-matter-embassy/rs-matter-embassy", default-features = false, features = [
+rs-matter-embassy = { git = "https://github.com/ivmarkov/rs-matter-embassy", rev = "ecc674f7bacf81dded484b96123a31e59cd44cf8", default-features = false, features = [
     "esp",
     "log",
     "trouble",
     "openthread",
-    "openthread-ftd",
     "mbedtls",
-    "openthread-heap-int-32768",
+    "openthread-heap-int-8192",
     "events-ringbuf-size-256",
     "groups",
 ] }
@@ -79,7 +92,18 @@ esp-alloc = { version = "0.11" }
 esp-storage = { version = "0.10", features = ["esp32c6", "embedded-storage"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32c6", "log-04"] }
 esp-metadata-generated = { version = "0.5", features = ["esp32c6"] }
-esp-println = { version = "0.18", features = ["esp32c6", "log-04"] }
+# `jtag-serial` rather than the default `auto`: the Mill owns GPIO16/17, which are
+# also UART0's default console pins, so the log console has to be pinned to the USB
+# Serial/JTAG peripheral. `auto` would fall back to UART0 whenever no USB host is
+# attached and spray log lines at the heater's MCU. `colors` and `critical-section`
+# are the rest of the default set, kept.
+esp-println = { version = "0.18", default-features = false, features = [
+    "esp32c6",
+    "log-04",
+    "jtag-serial",
+    "colors",
+    "critical-section",
+] }
 esp-backtrace = { version = "0.20", features = ["esp32c6", "panic-handler", "println"] }
 
 # The C6 is single-core but `esp-rtos` needs real atomics across its interrupt
@@ -95,8 +119,16 @@ tinyrlibc = { version = "0.5", default-features = false, features = ["memchr", "
 # our fork of `rs-matter`, which carries the Thermostat and Electrical Sensor
 # cluster handlers. Version `0.4.1` satisfies the `^0.4` that `rs-matter-stack`
 # asks for, so no version surgery is needed.
-rs-matter = { path = "../rs-matter/rs-matter" }
-rs-matter-stack = { path = "../rs-matter-stack" }
+#
+# Both are pinned to a commit rather than a branch, so a checkout builds the same
+# graph a year from now. `rs-matter` is our fork and stays one until the PR adding
+# those handlers lands upstream; `rs-matter-stack` is unmodified upstream, pinned to
+# the commit this was developed against. Swap in the `path` lines to develop against
+# the sibling checkouts - `../rs-matter-embassy` has a matching pair above.
+rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c22fbe4a2fdc9a51c714281000f21f4224e82702" }
+rs-matter-stack = { git = "https://github.com/ivmarkov/rs-matter-stack", rev = "f3aa6091bd080e114a9d8e4e1a432e7b27365403" }
+# rs-matter = { path = "../rs-matter/rs-matter" }
+# rs-matter-stack = { path = "../rs-matter-stack" }
 
 # `rs-matter-embassy` is built against an unreleased `esp-hal`; the whole `esp-*`
 # family has to come from the same git revision or the peripheral singletons do not

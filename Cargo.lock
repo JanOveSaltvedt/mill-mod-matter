@@ -2768,9 +2768,12 @@ dependencies = [
  "esp-storage",
  "log",
  "portable-atomic",
+ "rs-matter",
  "rs-matter-embassy",
+ "serde",
  "static_cell",
  "tinyrlibc",
+ "toml",
 ]
 
 [[package]]
@@ -3541,6 +3544,7 @@ dependencies = [
 [[package]]
 name = "rs-matter"
 version = "0.4.1"
+source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c22fbe4a2fdc9a51c714281000f21f4224e82702#c22fbe4a2fdc9a51c714281000f21f4224e82702"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
@@ -3570,14 +3574,13 @@ dependencies = [
  "strum 0.28.0",
  "subtle",
  "time",
- "tokio",
- "tokio-stream",
  "verhoeff",
 ]
 
 [[package]]
 name = "rs-matter-codegen"
 version = "0.4.1"
+source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c22fbe4a2fdc9a51c714281000f21f4224e82702#c22fbe4a2fdc9a51c714281000f21f4224e82702"
 dependencies = [
  "convert_case 0.6.0",
  "miette",
@@ -3596,6 +3599,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-embassy"
 version = "0.1.0"
+source = "git+https://github.com/ivmarkov/rs-matter-embassy?rev=ecc674f7bacf81dded484b96123a31e59cd44cf8#ecc674f7bacf81dded484b96123a31e59cd44cf8"
 dependencies = [
  "bt-hci 0.10.1",
  "cfg-if",
@@ -3630,6 +3634,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-macros"
 version = "0.4.1"
+source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c22fbe4a2fdc9a51c714281000f21f4224e82702#c22fbe4a2fdc9a51c714281000f21f4224e82702"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3640,6 +3645,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-stack"
 version = "0.3.0"
+source = "git+https://github.com/ivmarkov/rs-matter-stack?rev=f3aa6091bd080e114a9d8e4e1a432e7b27365403#f3aa6091bd080e114a9d8e4e1a432e7b27365403"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
@@ -4218,26 +4224,6 @@ dependencies = [
  "displaydoc",
  "serde_core",
  "zerovec",
-]
-
-[[package]]
-name = "tokio"
-version = "1.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
-dependencies = [
- "pin-project-lite",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
 ]
 
 [[package]]

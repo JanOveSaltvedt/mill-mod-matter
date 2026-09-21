@@ -4,6 +4,8 @@
 target = "riscv32imac-unknown-none-elf"
 
 [target.'cfg(all(target_arch = "riscv32", target_os = "none"))']
+# The partition table and the flashing baud rate come from `espflash.toml`, so
+# they are not repeated here - see the comment there for why that matters.
 runner = "espflash flash --monitor"
 # `linkall.x` is `esp-hal`'s linker script. The two `*_backend_soft="compact"` cfgs
 # pick the small (rather than fast) software SHA-2 / AES implementations, which is

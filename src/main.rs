@@ -2,17 +2,18 @@
 //! Mill Gen 2 panel heater, replacing its WiFi controller.
 //!
 //! Endpoint 1 carries two device types. The Thermostat (`0x0301`, `HEAT`) is backed
-//! by [`SimulatedHeater`]: the local temperature drifts towards the heating setpoint
-//! while `SystemMode` is `Heat`, and back towards ambient otherwise. Beside it sits
-//! an Electrical Sensor (`0x0510`) - a *utility* device type, so the two share an
-//! endpoint - reporting the heating element through Power Topology, Electrical Power
-//! Measurement and Electrical Energy Measurement: what the element draws while the
-//! relay is closed, and how much energy it has drawn over the device's lifetime.
+//! by [`MillHeater`], which observes rather than drives: the Mill's own
+//! microcontroller keeps the temperature sensor, the triac and the control loop, and
+//! this board replaces only the WiFi module that advises it over a 9600-baud UART.
+//! Beside the thermostat sits an Electrical Sensor (`0x0510`) - a *utility* device
+//! type, so the two share an endpoint - reporting the heating element through Power
+//! Topology, Electrical Power Measurement and Electrical Energy Measurement: what
+//! the element draws while the Mill has it on, and how much energy it has drawn
+//! over the device's lifetime. There is no metering hardware behind either, only
+//! the element's plate rating and the on/off bit the Mill reports, which is why
+//! `meter.rs` serves `ActivePower` and the energy totals and nothing else.
 //!
-//! **Milestone 1: the heater interface is simulated.** No GPIO drives a relay and no
-//! ADC reads a thermistor; `heater.rs` is the single module real hardware I/O
-//! replaces. Everything else - BLE commissioning, joining a Thread network, SRP
-//! registration, the data model and NVS persistence - is real.
+//! The wire protocol is in `mill.rs` and the UART that carries it in `heater.rs`.
 //!
 //! The structure is lifted from `rs-matter-embassy`'s own examples: see
 //! `../rs-matter-embassy/examples/esp/src/bin/light_thread.rs` for the stack wiring
@@ -55,28 +56,34 @@ use rs_matter_embassy::matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter_embassy::matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter_embassy::matter::dm::clusters::groups::{self, ClusterHandler as _};
 use rs_matter_embassy::matter::dm::clusters::identify::{self, IdentifyHandler};
-use rs_matter_embassy::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM};
+use rs_matter_embassy::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT};
 use rs_matter_embassy::matter::dm::devices::{DEV_TYPE_ELECTRICAL_SENSOR, DEV_TYPE_THERMOSTAT};
 use rs_matter_embassy::matter::dm::endpoints::ROOT_ENDPOINT_ID;
 use rs_matter_embassy::matter::dm::{Async, Dataver, EmptyHandler, Endpoint, Node};
 use rs_matter_embassy::matter::error::Error;
 use rs_matter_embassy::matter::persist::KvBlobStore;
+use rs_matter_embassy::matter::sc::pase::{Spake2pVerifierPassword, Spake2pVerifierPasswordRef};
 use rs_matter_embassy::matter::utils::init::InitMaybeUninit;
+use rs_matter_embassy::matter::BasicCommData;
 use rs_matter_embassy::matter::{clusters, devices};
 use rs_matter_embassy::persist::SeqMapKvBlobStore;
 use rs_matter_embassy::stack::rand::reseeding_csprng;
 use rs_matter_embassy::wireless::esp::EspThreadDriver;
 use rs_matter_embassy::wireless::{EmbassyThread, EmbassyThreadMatterStack};
 
+use static_cell::StaticCell;
+
 use tinyrlibc as _;
 
-use crate::heater::SimulatedHeater;
+use crate::heater::MillHeater;
 use crate::meter::{ElecEnergyDeviceLogic, ElecPwrDeviceLogic};
 use crate::thermostat::ThermostatDeviceLogic;
 use crate::vendor_kv::VendorKv;
 
+mod config;
 mod heater;
 mod meter;
+mod mill;
 mod thermostat;
 mod vendor_kv;
 
@@ -150,8 +157,26 @@ async fn main(_s: Spawner) {
     // Allocate the Matter stack statically: its footprint is ~35-50KB, which would
     // blow the program stack, and the wireless variants require it anyway.
     let stack = mk_static!(EmbassyThreadMatterStack::<BUMP_SIZE, ()>).init_with(
-        EmbassyThreadMatterStack::init(&DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT),
+        EmbassyThreadMatterStack::init(dev_det(), dev_comm(), &TEST_DEV_ATT),
     );
+
+    // The Mill UART: GPIO16 out to the heater's MCU, GPIO17 back, 9600 8N1 (the rest
+    // of `Config::default()`), no flow control. The pins are the ones wired to the
+    // Mill's module header.
+    //
+    // They are also the ESP32-C6's *default UART0 console* pins, which is why the
+    // Mill gets UART1 while the log console goes out over USB Serial/JTAG - see the
+    // `esp-println` features in `Cargo.toml`. The ROM bootloader still says its
+    // piece on UART0 at reset, before any of this runs; those bytes do reach the
+    // Mill's MCU, framed as nothing it understands.
+    let mill_uart = esp_hal::uart::Uart::new(
+        peripherals.UART1,
+        esp_hal::uart::Config::default().with_baudrate(mill::BAUD_RATE),
+    )
+    .unwrap()
+    .with_tx(peripherals.GPIO16)
+    .with_rx(peripherals.GPIO17)
+    .into_async();
 
     // The NVS-backed KV store. `get_persistent_store` only needs a small scratch
     // buffer to parse the partition table, so we give it a local one.
@@ -181,7 +206,7 @@ async fn main(_s: Spawner) {
         // the heater. Loading here rather than later matters: it has to happen before
         // the `Startup` lifecycle op reaches the handlers, because that is where the
         // Thermostat handler validates and repairs what we just loaded.
-        let heater = SimulatedHeater::new(&kv);
+        let heater = MillHeater::new(&kv, mill_uart);
 
         let thermostat_handler = ThermostatHandler::new(
             Dataver::new_rand(&mut weak_rand),
@@ -349,19 +374,139 @@ async fn main(_s: Spawner) {
     esp_hal::system::software_reset()
 }
 
+/// The identity strings that have to differ from board to board, derived once at
+/// boot from the chip's factory MAC.
+///
+/// `rs-matter`'s `TEST_DEV_DET` cannot serve here: it hard-codes
+/// `serial_no: "123456789"` and inherits an empty `unique_id` from
+/// `BasicInfoConfig::new()`, so *every* board built from it reports the same
+/// `SerialNumber` and no `UniqueID` at all. A controller that keys its own device
+/// records on the serial number - Home Assistant does, alongside the node ID -
+/// folds two physically different nodes into one device on that alone.
+///
+/// `BasicInfoConfig` borrows every string it serves, so these have to outlive the
+/// Matter stack; hence [`dev_det`] and its `StaticCell`s rather than a `const`.
+struct DeviceIdentity {
+    /// The factory MAC-48 as twelve uppercase hex digits - the same bytes the SRP
+    /// host name in the log is built from, so the two can be matched up by eye.
+    serial_no: [u8; 12],
+    /// The serial number behind [`config::UNIQUE_ID_PREFIX`].
+    ///
+    /// `UniqueID` is mandatory from Basic Information cluster revision 4, which is
+    /// what Matter 1.6 asks for, and `BasicInfoConfig::new()` leaves it empty.
+    /// Deriving it from the MAC rather than minting a random one and persisting it
+    /// is deliberate: the attribute is `persistence="fixed"`, and a value living in
+    /// the KV store would not survive the factory reset that a fixed value must.
+    /// A certified device would carry an independent factory-provisioned value.
+    unique_id: [u8; config::UNIQUE_ID_PREFIX.len() + 12],
+}
+
+impl DeviceIdentity {
+    fn from_factory_mac() -> Self {
+        let mac = esp_hal::efuse::base_mac_address();
+
+        let mut serial_no = [0; 12];
+        hex(mac.as_bytes(), &mut serial_no);
+
+        let mut unique_id = [0; config::UNIQUE_ID_PREFIX.len() + 12];
+        unique_id[..config::UNIQUE_ID_PREFIX.len()]
+            .copy_from_slice(config::UNIQUE_ID_PREFIX.as_bytes());
+        unique_id[config::UNIQUE_ID_PREFIX.len()..].copy_from_slice(&serial_no);
+
+        Self {
+            serial_no,
+            unique_id,
+        }
+    }
+
+    fn serial_no(&self) -> &str {
+        // Infallible: every byte was put there as an ASCII hex digit.
+        core::str::from_utf8(&self.serial_no).unwrap()
+    }
+
+    fn unique_id(&self) -> &str {
+        // Infallible: an ASCII literal followed by ASCII hex digits.
+        core::str::from_utf8(&self.unique_id).unwrap()
+    }
+}
+
+/// Write `bytes` into `out` as uppercase hex; `out` must be twice as long.
+fn hex(bytes: &[u8], out: &mut [u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
+    for (byte, out) in bytes.iter().zip(out.chunks_exact_mut(2)) {
+        out[0] = DIGITS[usize::from(byte >> 4)];
+        out[1] = DIGITS[usize::from(byte & 0x0f)];
+    }
+}
+
 /// Basic info about our device.
 ///
-/// The attestation data is still `rs-matter`'s test DAC/PAI, so a commissioner will
-/// warn that the device is uncertified - expected, and harmless for a private
-/// fabric. The vendor and product IDs are the CSA *test* ones for the same reason.
-const DEV_DET: BasicInfoConfig = BasicInfoConfig {
-    vendor_name: "Mill Mod",
-    product_name: "Mill Gen 2 Thermostat",
-    // The mDNS-to-SRP bridge wants this: how long, in ms, a sleepy device may take
-    // to answer. Same value the `rs-matter-embassy` Thread example uses.
-    sai: Some(500),
-    ..rs_matter_embassy::matter::dm::devices::test::TEST_DEV_DET
-};
+/// Everything a Mill owner might reasonably want to change comes from `config.toml`
+/// by way of [`config`]; what is left inherited from `TEST_DEV_DET` is the part that
+/// is not ours to pick. The attestation data is still `rs-matter`'s test DAC/PAI, so
+/// a commissioner will warn that the device is uncertified - expected, and harmless
+/// on a private fabric - and `vid`/`pid` stay at the CSA *test* values because the
+/// test DAC is issued for exactly those: a `BasicInformation` value that disagreed
+/// with the certificate would fail device attestation outright rather than merely
+/// warn, so those two are deliberately not configurable.
+///
+/// The serial number and the unique ID are derived per board, which is why this is a
+/// function rather than a `const` - see [`DeviceIdentity`].
+///
+/// Called exactly once; a second call panics on the already-initialised
+/// `StaticCell`, which is the right way for that mistake to show up.
+fn dev_det() -> &'static BasicInfoConfig<'static> {
+    static IDENTITY: StaticCell<DeviceIdentity> = StaticCell::new();
+    static DEV_DET: StaticCell<BasicInfoConfig<'static>> = StaticCell::new();
+
+    let identity: &'static DeviceIdentity = IDENTITY.init(DeviceIdentity::from_factory_mac());
+
+    // An explicit `device.serial_number` overrides the MAC-derived one; the unique ID
+    // never follows it, because that attribute is `fixed`-quality and has to stay
+    // per-board whatever a shared config file says.
+    let serial_no = config::SERIAL_NUMBER.unwrap_or_else(|| identity.serial_no());
+
+    info!(
+        "Device serial number {}, unique ID {}",
+        serial_no,
+        identity.unique_id()
+    );
+
+    DEV_DET.init(BasicInfoConfig {
+        vendor_name: config::VENDOR_NAME,
+        product_name: config::PRODUCT_NAME,
+        product_label: config::PRODUCT_LABEL,
+        part_number: config::PART_NUMBER,
+        hw_ver: config::HW_VER,
+        hw_ver_str: config::HW_VER_STR,
+        sw_ver: config::SW_VER,
+        sw_ver_str: config::SW_VER_STR,
+        manufacturing_date: config::MANUFACTURING_DATE,
+        device_name: config::DEVICE_NAME,
+        serial_no,
+        unique_id: identity.unique_id(),
+        // The mDNS-to-SRP bridge wants this: how long, in ms, a sleepy device may
+        // take to answer. Same value the `rs-matter-embassy` Thread example uses.
+        sai: Some(500),
+        ..rs_matter_embassy::matter::dm::devices::test::TEST_DEV_DET
+    })
+}
+
+/// The passcode and discriminator behind the pairing codes printed at boot.
+///
+/// `TEST_DEV_COMM`'s 20202021/3840 are the defaults in `config.toml`, but unlike the
+/// VID/PID they are ours to change: nothing cross-checks them against the test
+/// certificate. Giving a second board its own discriminator is the point - two boards
+/// advertising 3840 at the same time are genuinely ambiguous to a commissioner.
+fn dev_comm() -> BasicCommData {
+    BasicCommData {
+        password: Spake2pVerifierPassword::new_from_ref(Spake2pVerifierPasswordRef::new(
+            &config::PASSCODE.to_le_bytes(),
+        )),
+        discriminator: config::DISCRIMINATOR,
+    }
+}
 
 /// The Node meta-data describing our Matter device.
 ///
