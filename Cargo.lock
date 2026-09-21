@@ -2768,6 +2768,7 @@ dependencies = [
  "esp-storage",
  "log",
  "portable-atomic",
+ "rs-matter",
  "rs-matter-embassy",
  "serde",
  "static_cell",

@@ -59,8 +59,9 @@ The toolchain (nightly + `rust-src` + the RISC-V target) is pinned by
 ## Configuration
 
 Per-unit settings live in **`config.toml`** at the repo root, which documents every key
-inline. `build.rs` validates the file and generates `src/config.rs` from it, so a bad
-value fails the build with a sentence instead of reaching a board.
+inline. `build.rs` validates the file and generates `src/config.rs` from it — and the
+pairing codes under `commissioning/` — so a bad value fails the build with a sentence
+instead of reaching a board.
 
 It is resolved at build time, not read at boot: there is no filesystem on the device,
 and several of the values land in `const` contexts that a runtime value could not
@@ -148,31 +149,31 @@ QR code plus a manual pairing code on the console. Scan or type it into your
 controller's app. It will warn that the device is uncertified — it ships `rs-matter`'s
 test attestation and the CSA test VID/PID, which is expected on a private fabric.
 
-A console is not actually required to get those codes. Nothing in them is generated at
-runtime: they are the `[commissioning]` passcode and discriminator from `config.toml`,
+A console is not actually required to get those codes, which matters: a heater is
+usually closed up before it is ever commissioned. Nothing in them is generated at
+runtime — they are the `[commissioning]` passcode and discriminator from `config.toml`,
 plus the fixed test VID/PID, the standard commissioning flow and BLE as the only
-discovery capability - which is what the firmware advertises, since it commissions over
-BLE before it has joined Thread. So they can be generated on a workstation, with the
-payload utilities in `chip-tool` (no device and no fabric involved):
+discovery capability, since the device commissions over BLE before it has joined
+Thread. So the build produces them, into **`commissioning/`**:
 
-```sh
-chip-tool payload generate-qrcode \
-    --discriminator 3840 --setup-pin-code 20202021 \
-    --vendor-id 65521 --product-id 32769 \
-    --version 0 --commissioning-mode 0 --rendezvous 2
+| | |
+| --- | --- |
+| `commissioning/qr.svg` | The QR code as a scalable image, 40 mm square at its natural size. This is the one to print or open in a browser. |
+| `commissioning/pairing.txt` | The `MT:...` payload, the manual pairing code, the parameters behind both, and the same block art the console shows. |
 
-chip-tool payload generate-manualcode \
-    --discriminator 3840 --setup-pin-code 20202021 \
-    --version 0 --commissioning-mode 0
-```
+Both are written by `build.rs` on every `cargo build`, are regenerated when
+`config.toml` or `config.local.toml` changes, and are gitignored — on a tree with a
+`config.local.toml` they are the codes of one particular board. `build.rs` encodes
+them with `rs-matter`'s own `pairing::qr`, the code the firmware runs, so the two
+cannot drift apart. (That is the second, host-side build of `rs-matter` in the
+dependency graph, and roughly a minute on a clean tree.)
 
-`3840` and `20202021` are the defaults; pass whatever `config.toml` says if either was
-changed. `65521`/`32769` are `0xFFF1`/`0x8001` in decimal, and the manual code needs
-neither — on the standard commissioning flow it is the 11-digit short code, which
-carries only the discriminator and the passcode. The QR string matches the board's
-`MT:...` exactly; the manual code matches too, the board just groups it `XXXX-XXX-XXXX`
-for reading aloud. So a heater that was closed up before it was ever commissioned can
-still be paired, from a printout made beforehand.
+The manual code is byte-for-byte what the board prints, modulo the `XXXX-XXX-XXXX`
+grouping it uses for reading aloud. The QR payload differs from the board's in exactly
+one field: `rs-matter` folds `SerialNumber` into the payload as optional TLV data, and
+each board derives its own from the chip's factory MAC, which a build cannot know. A
+commissioner does not need that field — both codes carry the same discriminator and
+passcode — so both pair. Only the strings differ.
 
 Once commissioned, the monitor shows the link to the heater: the first few status
 frames raw (`Mill: RX 5A ...`, with the gap since the previous one), then

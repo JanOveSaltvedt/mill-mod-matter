@@ -11,13 +11,23 @@ path = "src/main.rs"
 # No `libtest` on a bare-metal target.
 harness = false
 
-# `build.rs` turns `config.toml` into the constants `src/config.rs` exposes. Both of
-# these are already in the lock file by way of `esp-config`, so naming them here adds
-# no new crate to the graph. Host-compiled, so the crate's `no_std` rules do not reach
-# them and `build-std` does not apply.
+# `build.rs` turns `config.toml` into the constants `src/config.rs` exposes, and into
+# the onboarding artifacts under `commissioning/`. Host-compiled, so the crate's
+# `no_std` rules do not reach them and `build-std` does not apply.
+#
+# `toml` and `serde` are already in the lock file by way of `esp-config`, so naming
+# them here adds no new crate to the graph.
+#
+# `rs-matter` does: this is a *second*, host-targeted build of it, on top of the one
+# the firmware links. It is what makes the generated QR payload the same code path the
+# device runs rather than a re-implementation of the Core spec's bit packing - so the
+# two cannot drift. `default-features = false` drops the crypto backend, the OS
+# transports and the logging facade, none of which `pairing::qr` needs, and leaves a
+# build of roughly a minute that only a clean tree or a `Cargo.toml` change pays.
 [build-dependencies]
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+rs-matter = { path = "../rs-matter/rs-matter", default-features = false }
 
 [dependencies]
 log = "0.4"

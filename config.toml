@@ -101,9 +101,9 @@ unique_id_prefix = "MILLMOD-"
 [commissioning]
 # The passcode and discriminator behind the QR and manual pairing codes, which the
 # firmware prints at boot - change these and the printed codes follow. They are also
-# all it takes to regenerate those codes on a workstation, so a board already sealed
-# inside a heater can still be commissioned; the README has the `chip-tool payload`
-# commands.
+# all it takes to produce those codes without a board, which is what `build.rs` writes
+# into `commissioning/` on every build, so a board already sealed inside a heater can
+# still be commissioned from a printout.
 #
 # Give a second board its own discriminator. Two boards advertising 3840 at the same
 # time are genuinely ambiguous to a commissioner, which is the one commissioning

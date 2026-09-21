@@ -109,7 +109,9 @@ config.toml        per-unit settings: the element's wattage, the setpoint range,
                    Basic Information strings, the pairing passcode/discriminator.
                    Documented inline; `config.local.toml` (gitignored) overrides it
                    key by key
-build.rs           parses and validates those, generates `src/config.rs` into OUT_DIR
+build.rs           parses and validates those, generates `src/config.rs` into OUT_DIR,
+                   and writes the QR/manual pairing codes into `commissioning/`
+                   (gitignored) using rs-matter's own `pairing::qr`
 src/config.rs      six lines: `include!`s the generated constants
 src/main.rs        stack wiring, the `NODE` metadata, the handler chain, NVS store,
                    factory reset, the Mill UART's construction
@@ -220,8 +222,8 @@ None of these is obvious from the code.
   cannot be configured because the test DAC is issued for them. The passcode and
   discriminator are shared only by default: `[commissioning]` exists because two
   boards advertising discriminator 3840 at the same time are genuinely ambiguous to a
-  commissioner. Those two are also all a workstation needs to regenerate the printed
-  QR and manual codes - see the README's `chip-tool payload` recipe, which is how a
+  commissioner. Those two are also all it takes to produce the printed QR and manual
+  codes without a board, which is what `build.rs` writes into `commissioning/` - how a
   board sealed inside a heater gets commissioned.
 - **The device is uncertified.** It ships `rs-matter`'s test DAC/PAI and the CSA test
   VID/PID, so every commissioner warns about it. Expected on a private fabric.
@@ -242,6 +244,22 @@ None of these is obvious from the code.
   milliwatt-*seconds* of energy already integrated, not accumulated on-time, so a
   corrected plate rating leaves the lifetime total monotone - it just becomes two
   segments at two rates, and needs no migration.
+- **`build.rs` builds `rs-matter` a second time, for the host.** That is what the
+  `[build-dependencies]` entry is, and it is deliberate: `commissioning/`'s QR payload
+  comes out of `rs-matter`'s own `pairing::qr` rather than a second implementation of
+  the Core spec's bit packing, so the printed code and the one the board advertises
+  cannot drift. `default-features = false` is enough - `pairing::qr` needs no crypto
+  backend, no transport and no logging facade - and costs about a minute on a clean
+  tree. One field *does* differ: the board folds its MAC-derived `SerialNumber` into
+  the payload as optional TLV data and a build cannot know it, so the two `MT:`
+  strings differ while both still pair.
+- **The onboarding artifacts are written only when their bytes change.** `build.rs`
+  declares `rerun-if-changed` on the `commissioning/` *directory*, so deleting an
+  artifact brings it back - and cargo reads a directory as the newest mtime anywhere
+  under it. Rewriting identical files every build would leave that directory
+  permanently newer than the build script's own `output` file, which cargo streams
+  while the script runs, and the script would rerun, and recompile the crate, forever.
+  `write_artifact` compares first for exactly this reason.
 - **The restored setpoint limits are clamped to the absolute range.** Narrowing
   `heater.min/max_setpoint_celsius` on a commissioned device would otherwise leave the
   persisted `Min/MaxHeatSetpointLimit` outside `AbsMin/AbsMaxHeatSetpointLimit`, which
