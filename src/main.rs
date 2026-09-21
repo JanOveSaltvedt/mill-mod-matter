@@ -68,6 +68,8 @@ use rs_matter_embassy::stack::rand::reseeding_csprng;
 use rs_matter_embassy::wireless::esp::EspThreadDriver;
 use rs_matter_embassy::wireless::{EmbassyThread, EmbassyThreadMatterStack};
 
+use static_cell::StaticCell;
+
 use tinyrlibc as _;
 
 use crate::heater::MillHeater;
@@ -151,7 +153,7 @@ async fn main(_s: Spawner) {
     // Allocate the Matter stack statically: its footprint is ~35-50KB, which would
     // blow the program stack, and the wireless variants require it anyway.
     let stack = mk_static!(EmbassyThreadMatterStack::<BUMP_SIZE, ()>).init_with(
-        EmbassyThreadMatterStack::init(&DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT),
+        EmbassyThreadMatterStack::init(dev_det(), TEST_DEV_COMM, &TEST_DEV_ATT),
     );
 
     // The Mill UART: GPIO16 out to the heater's MCU, GPIO17 back, 9600 8N1 (the rest
@@ -369,19 +371,113 @@ async fn main(_s: Spawner) {
     esp_hal::system::software_reset()
 }
 
+/// The prefix that keeps `UniqueID` from being byte-for-byte the serial number.
+const UNIQUE_ID_PREFIX: &str = "MILLMOD-";
+
+/// The identity strings that have to differ from board to board, derived once at
+/// boot from the chip's factory MAC.
+///
+/// These were `rs-matter`'s test constants until a second ESP32-C6 running this
+/// firmware appeared on the same network. `TEST_DEV_DET` hard-codes
+/// `serial_no: "123456789"` and inherits an empty `unique_id` from
+/// `BasicInfoConfig::new()`, so *every* board built from it reports the same
+/// `SerialNumber` and no `UniqueID` at all. A controller that keys its own device
+/// records on the serial number - Home Assistant does, alongside the node ID -
+/// then folds two physically different nodes into one device, which is how a
+/// bench board and a heater end up sharing an entry.
+///
+/// `BasicInfoConfig` borrows every string it serves, so these have to outlive the
+/// Matter stack; hence [`dev_det`] and its `StaticCell`s rather than a `const`.
+struct DeviceIdentity {
+    /// The factory MAC-48 as twelve uppercase hex digits - the same bytes the SRP
+    /// host name in the log is built from, so the two can be matched up by eye.
+    serial_no: [u8; 12],
+    /// The serial number behind [`UNIQUE_ID_PREFIX`].
+    ///
+    /// `UniqueID` is mandatory from Basic Information cluster revision 4, which is
+    /// what Matter 1.6 asks for, and this device was serving the empty string.
+    /// Deriving it from the MAC rather than minting a random one and persisting it
+    /// is deliberate: the attribute is `persistence="fixed"`, and a value living in
+    /// the KV store would not survive the factory reset that a fixed value must.
+    /// A certified device would carry an independent factory-provisioned value.
+    unique_id: [u8; UNIQUE_ID_PREFIX.len() + 12],
+}
+
+impl DeviceIdentity {
+    fn from_factory_mac() -> Self {
+        let mac = esp_hal::efuse::base_mac_address();
+
+        let mut serial_no = [0; 12];
+        hex(mac.as_bytes(), &mut serial_no);
+
+        let mut unique_id = [0; UNIQUE_ID_PREFIX.len() + 12];
+        unique_id[..UNIQUE_ID_PREFIX.len()].copy_from_slice(UNIQUE_ID_PREFIX.as_bytes());
+        unique_id[UNIQUE_ID_PREFIX.len()..].copy_from_slice(&serial_no);
+
+        Self {
+            serial_no,
+            unique_id,
+        }
+    }
+
+    fn serial_no(&self) -> &str {
+        // Infallible: every byte was put there as an ASCII hex digit.
+        core::str::from_utf8(&self.serial_no).unwrap()
+    }
+
+    fn unique_id(&self) -> &str {
+        // Infallible: an ASCII literal followed by ASCII hex digits.
+        core::str::from_utf8(&self.unique_id).unwrap()
+    }
+}
+
+/// Write `bytes` into `out` as uppercase hex; `out` must be twice as long.
+fn hex(bytes: &[u8], out: &mut [u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
+    for (byte, out) in bytes.iter().zip(out.chunks_exact_mut(2)) {
+        out[0] = DIGITS[usize::from(byte >> 4)];
+        out[1] = DIGITS[usize::from(byte & 0x0f)];
+    }
+}
+
 /// Basic info about our device.
 ///
 /// The attestation data is still `rs-matter`'s test DAC/PAI, so a commissioner will
 /// warn that the device is uncertified - expected, and harmless for a private
-/// fabric. The vendor and product IDs are the CSA *test* ones for the same reason.
-const DEV_DET: BasicInfoConfig = BasicInfoConfig {
-    vendor_name: "Mill Mod",
-    product_name: "Mill Gen 2 Thermostat",
-    // The mDNS-to-SRP bridge wants this: how long, in ms, a sleepy device may take
-    // to answer. Same value the `rs-matter-embassy` Thread example uses.
-    sai: Some(500),
-    ..rs_matter_embassy::matter::dm::devices::test::TEST_DEV_DET
-};
+/// fabric. The vendor and product IDs are the CSA *test* ones for the same reason,
+/// and so are the passcode and discriminator in `TEST_DEV_COMM`: all of those are
+/// shared by every board built from this firmware, and all of them are fine to
+/// share, because none of them is what a controller files a device under.
+///
+/// The serial number and the unique ID are not shared, and that is why this is a
+/// function rather than the `const` it used to be - see [`DeviceIdentity`].
+///
+/// Called exactly once; a second call panics on the already-initialised
+/// `StaticCell`, which is the right way for that mistake to show up.
+fn dev_det() -> &'static BasicInfoConfig<'static> {
+    static IDENTITY: StaticCell<DeviceIdentity> = StaticCell::new();
+    static DEV_DET: StaticCell<BasicInfoConfig<'static>> = StaticCell::new();
+
+    let identity: &'static DeviceIdentity = IDENTITY.init(DeviceIdentity::from_factory_mac());
+
+    info!(
+        "Device serial number {}, unique ID {}",
+        identity.serial_no(),
+        identity.unique_id()
+    );
+
+    DEV_DET.init(BasicInfoConfig {
+        vendor_name: "Mill Mod",
+        product_name: "Mill Gen 2 Thermostat",
+        serial_no: identity.serial_no(),
+        unique_id: identity.unique_id(),
+        // The mDNS-to-SRP bridge wants this: how long, in ms, a sleepy device may
+        // take to answer. Same value the `rs-matter-embassy` Thread example uses.
+        sai: Some(500),
+        ..rs_matter_embassy::matter::dm::devices::test::TEST_DEV_DET
+    })
+}
 
 /// The Node meta-data describing our Matter device.
 ///

@@ -193,6 +193,18 @@ Each of these cost real investigation. None is obvious from the code.
 - **Commissioning is non-concurrent** (`stack.run`): BLE first, then Thread. Some
   controllers - `rs-matter-embassy`'s README names Alexa - want the concurrent path.
   Switching is a two-line change; `light_thread_coex.rs` is the reference.
+- **`TEST_DEV_DET` is the same device on every board.** It hard-codes
+  `serial_no: "123456789"` and inherits an empty `unique_id` from
+  `BasicInfoConfig::new()` - and Matter 1.6 makes `UniqueID` mandatory (Basic
+  Information cluster revision 4, `BasicInformationCluster.xml`). A controller that
+  files devices under the serial number as well as the node ID - Home Assistant
+  does - then folds two physically different boards into one record, so a bench
+  board and a heater commissioned onto the same fabric collapse into one device
+  while the controller still sees two nodes. `dev_det()` in `main.rs` derives both
+  strings from the factory MAC instead. The passcode, discriminator, VID/PID and
+  test DAC are still shared by every board and that is fine - none of them is what a
+  controller files a device under - though two boards advertising discriminator 3840
+  at the same time are genuinely ambiguous to a commissioner.
 - **The device is uncertified.** It ships `rs-matter`'s test DAC/PAI and the CSA test
   VID/PID, so every commissioner warns about it. Expected on a private fabric.
 
