@@ -122,6 +122,8 @@ src/heater.rs      MillHeater: the UART halves, the state the Mill reports, the 
 src/thermostat.rs  ThermostatHooks - heating-only, setpoints persisted, no control
                    loop (the Mill owns that)
 src/meter.rs       ElecPwrMeasHooks + ElecEnergyMeasHooks - what the element draws
+src/element.rs     ModeSelectHooks + a manufacturer-specific cluster on EP2: what the
+                   element is *rated* at, which is the only thing the meter scales by
 src/vendor_kv.rs   object-safe view of the Matter KV store + our key constants
 ```
 
@@ -168,9 +170,10 @@ None of these is obvious from the code.
   because they are not Thread devices - do not copy their key numbers.
 - **Factory reset does not clear our state for us.** `Matter::factory_reset` only
   removes rs-matter's own keys (they grow *downwards* from `VENDOR_KEYS_START`), and
-  the `FactoryReset` lifecycle op does not reach the hooks - `ThermostatHooks` and
-  `ElecEnergyMeasHooks` have no lifecycle method. `main.rs` removes the two vendor
-  blobs explicitly; see the comment there before adding a third.
+  the `FactoryReset` lifecycle op does not reach the hooks - `ThermostatHooks`,
+  `ElecEnergyMeasHooks` and `ModeSelectHooks` have no lifecycle method. `main.rs`
+  removes the three vendor blobs explicitly; see the comment there before adding a
+  fourth.
 - **A KV write blocks the entire stack.** `SeqMapKvBlobStore` is an
   `embassy_futures::block_on` around `sequential-storage`, over an `esp-storage`
   `FlashStorage` that takes a critical section - cache off, interrupts off - for
@@ -197,6 +200,40 @@ None of these is obvious from the code.
 - **`impl ElecEnergyMeasHooks for &T` does not forward `cumulative_energy_reset`.**
   Pass the device logic *by value* into `ElecEnergyMeasHandler::new`, never by
   reference, or that attribute silently reads null.
+- **The element's rating is the one runtime-settable config value.** Everything else
+  in `config.toml` is the last word; `heater.element_watts` is a *default* that EP2's
+  Mode Select cluster (and the manufacturer-specific cluster beside it) can override
+  into the KV store. It works only because nothing about the rating is `const`-bound -
+  `active_power_mw` merely reads it. `metering_accuracy_percent` and
+  `circuit_max_watts` still are, through `ElecPwrMeasHooks::ACCURACY`, which is also
+  why `circuit_max_watts` is the ceiling both write paths check against: a larger
+  rating would report an `ActivePower` above the `MaxMeasuredValue` the accuracy range
+  advertises.
+- **Mode Select needs an endpoint of its own.** Its device type (`0x0027`) is
+  `class="simple"`, i.e. an *application* device type like Thermostat, and core 9.2.1
+  allows a simple endpoint only one - which is the same rule that lets the Electrical
+  Sensor (`class="utility"`) share EP1. Hence EP2. A manufacturer-specific cluster has
+  no such constraint and may sit anywhere; `ELEMENT_WATTS_CLUSTER` sits beside it.
+- **Two clusters, one value, and `CurrentMode` is not nullable.** `CurrentMode` must
+  always name an entry in `SupportedModes`, so the exact-wattage attribute cannot
+  simply contradict the mode list - hence `CUSTOM_MODE`, and hence the write path
+  moving the mode through `ModeSelectHandler::apply_mode` rather than setting it
+  directly. Setting it directly would change the mode without notifying subscribers,
+  and a controller's select entity would sit on a stale option forever. `ElementWatts`
+  reads back the rating *in force* rather than the last figure written to it, so the
+  two clusters can be read in either order and never disagree; the cost is that a
+  `ChangeToMode` moves it without passing through its handler, which is what
+  `ElementWattsHandler::run` samples for.
+- **`MODES` values are persisted; never renumber them.** Appending is free, dropping
+  is survivable (`repair_current_mode` falls back to the *first* entry, which is why
+  the lowest rating is first), renumbering silently re-rates every device already
+  storing the old id. `modes_are_well_formed` const-asserts the invariants at build
+  time rather than leaving them to the handler's `Startup` panic.
+- **Changing the rating must `integrate()` first.** `heater.rs`'s `set_element_watts`
+  brings the energy counters up to date at the *old* rating before adopting the new
+  one, for the reason `integrate`'s own doc gives. That is what makes a correction from
+  600 to 582 W two honest segments rather than a retroactive restatement - and what
+  keeps the stored counter migration-free.
 - **Matcher closures must be non-capturing** — `FnMatcher = fn(EndptId, ClusterId)
   -> bool`. A capturing closure needs `ChainedHandler::new_with_matcher` and makes the
   chain type unnameable.
@@ -230,7 +267,8 @@ None of these is obvious from the code.
 
 ### Configuration
 
-- **The configuration is build-time, and has to be.** `config.toml` is read by
+- **The configuration is build-time, and has to be** - with `heater.element_watts`
+  the one deliberate exception, above. `config.toml` is read by
   `build.rs`, never by the firmware: there is no filesystem on the device, and three
   of the values are `const` associated items that could not be runtime values anyway -
   `ThermostatHooks::ABS_MIN/MAX_HEAT_SETPOINT` and the `ACCURACY` consts of both
@@ -243,7 +281,8 @@ None of these is obvious from the code.
 - **`heater.element_watts` does not invalidate the stored energy counter.** The blob is
   milliwatt-*seconds* of energy already integrated, not accumulated on-time, so a
   corrected plate rating leaves the lifetime total monotone - it just becomes two
-  segments at two rates, and needs no migration.
+  segments at two rates, and needs no migration. This holds for a rating corrected at
+  runtime through EP2 exactly as it does for a rebuild.
 - **`build.rs` builds `rs-matter` a second time, for the host.** That is what the
   `[build-dependencies]` entry is, and it is deliberate: `commissioning/`'s QR payload
   comes out of `rs-matter`'s own `pairing::qr` rather than a second implementation of

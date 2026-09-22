@@ -189,6 +189,14 @@ pub struct MillHeater<'a> {
     /// restore - which, for a counter living in the Matter KV store, is what a
     /// factory reset leaves behind.
     reset_at_boot: bool,
+    /// What the element is rated at, in watts.
+    ///
+    /// Runtime state rather than a build-time constant because the Mode Select
+    /// cluster on endpoint 2 sets it - see `element.rs`. It starts at
+    /// `config.toml`'s `heater.element_watts`, which is where a device with
+    /// nothing stored stays; `ElementRating::new` overwrites it from the KV store
+    /// before the Matter stack runs.
+    element_watts: Cell<u16>,
     kv: &'a dyn VendorKv,
 }
 
@@ -227,6 +235,7 @@ impl<'a> MillHeater<'a> {
             persisted_mws: Cell::new(energy_mws),
             persisted_ms: Cell::new(now),
             reset_at_boot,
+            element_watts: Cell::new(crate::config::DEFAULT_ELEMENT_WATTS),
             kv,
         }
     }
@@ -346,14 +355,40 @@ impl<'a> MillHeater<'a> {
     /// The power drawn right now, in milliwatts.
     ///
     /// The element's plate rating gated on one bit of the status frame - there is no
-    /// metering in the heater. `heater.element_watts` in `config.toml` carries the
-    /// rating, and why getting it right matters.
+    /// metering in the heater. [`MillHeater::element_watts`] carries the rating, and
+    /// `config.toml`'s `heater.element_watts` says why getting it right matters.
     pub fn active_power_mw(&self) -> i64 {
         if self.heating() {
-            crate::config::ELEMENT_POWER_MW
+            i64::from(self.element_watts.get()) * 1000
         } else {
             0
         }
+    }
+
+    /// Tell the heater what its element is rated at, in watts.
+    ///
+    /// Caps at `heater.circuit_max_watts`, which is the range
+    /// `ElectricalPowerMeasurement` advertises as measurable; both write paths in
+    /// `element.rs` refuse a larger value outright, so this is the belt to their
+    /// braces rather than the check anybody sees fail.
+    ///
+    /// The energy counters are brought up to date *first*, at the old rating, for
+    /// the reason [`MillHeater::integrate`] gives: the element may have been running
+    /// for most of this tick at a power the new rating never described. That makes a
+    /// correction from 600 to 582 W leave the lifetime total as two honest segments
+    /// at two rates rather than retroactively restating the first one - which is
+    /// also why the stored counter needs no migration when the rating changes.
+    pub fn set_element_watts(&self, watts: u16) {
+        let watts = watts.min(crate::config::CIRCUIT_MAX_WATTS);
+
+        if watts == self.element_watts.get() {
+            return;
+        }
+
+        self.integrate();
+        self.element_watts.set(watts);
+
+        info!("Heater: element rating is now {watts} W");
     }
 
     /// The energy drawn over the device's lifetime, in milliwatt-hours.

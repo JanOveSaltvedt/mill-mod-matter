@@ -14,9 +14,14 @@
 #
 # A key that is not recognised - in either file - fails the build rather than being
 # silently ignored, so a typo cannot reach a board.
+#
+# One key, `heater.element_watts`, is a default that the device can be told to
+# override over Matter; every other key here is the last word. Its own comment says
+# how.
 
 [heater]
-# The heating element's plate rating, in watts.
+# The heating element's plate rating in watts, as the device comes up with nothing
+# stored.
 #
 # THE one value to get right. There is no metering hardware in the Mill and none was
 # added by the mod, so every reading the Electrical Power and Electrical Energy
@@ -27,6 +32,17 @@
 # Read it off the plate on the back of the heater. Mill ships the same Gen 2 panel
 # from roughly 250 W to 2000 W; 600 is the rating of the unit this was developed
 # against - a configured number, never a measurement.
+#
+# Unlike everything else here, this one is only a *default*. A board is sealed inside
+# a heater and cannot be reflashed to correct a wrong rating, so endpoint 2 exposes it
+# over Matter: a Mode Select cluster offering the ratings Mill ships, and a
+# manufacturer-specific cluster taking an exact figure for a plate that reads 582 W.
+# Whatever is picked there is persisted and wins from the next boot on, until a
+# factory reset brings this value back. See `src/element.rs`.
+#
+# A rating that IS on that list is best set here anyway, so a fresh board is right
+# before anyone commissions it. A rating that is not on the list works the same way -
+# the device comes up in `Custom` mode at this wattage.
 element_watts = 600
 
 # The setpoint range the thermostat offers, in whole degrees Celsius.
@@ -55,7 +71,14 @@ metering_accuracy_percent = 5.0
 
 # The top of the reported power range, in watts: a 16 A single-phase circuit at 230 V,
 # which is the most the element could draw whatever it turns out to be rated at. Must
-# be at least `element_watts`. Only worth touching for a different supply standard.
+# be at least `element_watts`, and at most 65535. Only worth touching for a different
+# supply standard.
+#
+# Also the ceiling on the runtime rating: endpoint 2 refuses a mode or an exact figure
+# above this, because the accuracy range Electrical Power Measurement advertises is
+# built from it - an element claiming more would report an ActivePower above its own
+# MaxMeasuredValue. Lowering it for, say, a 6 A circuit therefore takes the larger
+# entries in the Mode Select list out of use, which is the intended effect.
 circuit_max_watts = 3680
 
 [device]
