@@ -3544,7 +3544,7 @@ dependencies = [
 [[package]]
 name = "rs-matter"
 version = "0.4.1"
-source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c22fbe4a2fdc9a51c714281000f21f4224e82702#c22fbe4a2fdc9a51c714281000f21f4224e82702"
+source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c6bd5e53bd369fc029169cb733184e5853eff54b#c6bd5e53bd369fc029169cb733184e5853eff54b"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
@@ -3580,7 +3580,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-codegen"
 version = "0.4.1"
-source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c22fbe4a2fdc9a51c714281000f21f4224e82702#c22fbe4a2fdc9a51c714281000f21f4224e82702"
+source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c6bd5e53bd369fc029169cb733184e5853eff54b#c6bd5e53bd369fc029169cb733184e5853eff54b"
 dependencies = [
  "convert_case 0.6.0",
  "miette",
@@ -3634,7 +3634,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-macros"
 version = "0.4.1"
-source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c22fbe4a2fdc9a51c714281000f21f4224e82702#c22fbe4a2fdc9a51c714281000f21f4224e82702"
+source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c6bd5e53bd369fc029169cb733184e5853eff54b#c6bd5e53bd369fc029169cb733184e5853eff54b"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
