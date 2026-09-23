@@ -28,6 +28,15 @@ pub const THERMOSTAT_STATE_KEY: u16 = VENDOR_KEYS_START + 1;
 /// Measurement cluster's `CumulativeEnergyImported`.
 pub const HEATING_ELEMENT_ENERGY_KEY: u16 = VENDOR_KEYS_START + 2;
 
+/// Which plate rating the element has been told it has, as three bytes: the Mode
+/// Select `CurrentMode` then the custom wattage as a little-endian `u16`.
+///
+/// Both halves in one blob on purpose. They are written together and read together,
+/// a custom wattage being meaningful only while `CurrentMode` selects it, and each
+/// `store_blob` stops the radio and the Mill UART for the length of a flash write,
+/// so one key costs half what two would.
+pub const ELEMENT_RATING_KEY: u16 = VENDOR_KEYS_START + 3;
+
 /// An object-safe view of a [`KvBlobStoreAccess`].
 ///
 /// [`KvBlobStoreAccess::access`] is generic over its closure, so there is no

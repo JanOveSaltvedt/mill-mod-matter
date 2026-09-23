@@ -13,6 +13,11 @@
 //! the element's plate rating and the on/off bit the Mill reports, which is why
 //! `meter.rs` serves `ActivePower` and the energy totals and nothing else.
 //!
+//! Endpoint 2 is where that plate rating is set. `config.toml` supplies the default,
+//! but a board sealed inside a heater cannot be rebuilt to correct it, so a Mode
+//! Select cluster offers the ratings Mill ships and a manufacturer-specific cluster
+//! beside it takes the exact figure - see `element.rs`.
+//!
 //! The wire protocol is in `mill.rs` and the UART that carries it in `heater.rs`.
 //!
 //! The structure is lifted from `rs-matter-embassy`'s own examples: see
@@ -56,8 +61,11 @@ use rs_matter_embassy::matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter_embassy::matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter_embassy::matter::dm::clusters::groups::{self, ClusterHandler as _};
 use rs_matter_embassy::matter::dm::clusters::identify::{self, IdentifyHandler};
+use rs_matter_embassy::matter::dm::clusters::mode_select::{self, ModeSelectHandler};
 use rs_matter_embassy::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT};
-use rs_matter_embassy::matter::dm::devices::{DEV_TYPE_ELECTRICAL_SENSOR, DEV_TYPE_THERMOSTAT};
+use rs_matter_embassy::matter::dm::devices::{
+    DEV_TYPE_ELECTRICAL_SENSOR, DEV_TYPE_MODE_SELECT, DEV_TYPE_THERMOSTAT,
+};
 use rs_matter_embassy::matter::dm::endpoints::ROOT_ENDPOINT_ID;
 use rs_matter_embassy::matter::dm::{Async, Dataver, EmptyHandler, Endpoint, Node};
 use rs_matter_embassy::matter::error::Error;
@@ -75,12 +83,14 @@ use static_cell::StaticCell;
 
 use tinyrlibc as _;
 
+use crate::element::{ElementRating, ElementWattsHandler};
 use crate::heater::MillHeater;
 use crate::meter::{ElecEnergyDeviceLogic, ElecPwrDeviceLogic};
 use crate::thermostat::ThermostatDeviceLogic;
 use crate::vendor_kv::VendorKv;
 
 mod config;
+mod element;
 mod heater;
 mod meter;
 mod mill;
@@ -99,6 +109,11 @@ macro_rules! mk_static {
 /// Endpoint 0 (the root endpoint) always runs the hidden Matter system clusters, so
 /// the thermostat gets ID=1.
 const THERMOSTAT_ENDPOINT: u16 = 1;
+
+/// The heating element's rating - what the meter is scaled by - lives on an endpoint
+/// of its own, because Mode Select's device type is an *application* one and core
+/// spec 9.2.1 allows a simple endpoint only one of those. See `element.rs`.
+const ELEMENT_ENDPOINT: u16 = 2;
 
 /// The amount of memory for allocating all `rs-matter-stack` futures created during
 /// the execution of the `run*` methods. This does NOT include the rest of the Matter
@@ -228,6 +243,28 @@ async fn main(_s: Spawner) {
             ElecEnergyDeviceLogic::new(&heater),
         );
 
+        // The element's rating, and the two clusters that set it. Built after the
+        // heater and before the stack runs: its constructor pushes the restored
+        // rating onto the heater, and `ModeSelectHandler` validates the mode table
+        // and repairs a stale `CurrentMode` when `Startup` reaches it.
+        //
+        // Both handlers borrow the rating rather than owning it, which is what keeps
+        // the two clusters one value. Unlike `ElecEnergyMeasHooks` - see the note on
+        // `cumulative_energy_reset` in CLAUDE.md - `impl ModeSelectHooks for &T`
+        // forwards every method, so `&ElementRating` is a complete hooks impl.
+        let rating = ElementRating::new(&kv, &heater);
+
+        let mode_handler = ModeSelectHandler::new(Dataver::new_rand(&mut weak_rand), &rating);
+
+        // Borrows `mode_handler` so that writing an exact wattage moves `CurrentMode`
+        // through the cluster that owns it, and subscribers hear about it.
+        let watts_handler = ElementWattsHandler::new(
+            Dataver::new_rand(&mut weak_rand),
+            ELEMENT_ENDPOINT,
+            &rating,
+            &mode_handler,
+        );
+
         // Chain our endpoint clusters. The chain is matched last-first.
         let handler = EmptyHandler
             // The Endpoint 0 system clusters that are ours to provide. The stack
@@ -272,6 +309,19 @@ async fn main(_s: Spawner) {
             .chain(
                 |e, c| e == THERMOSTAT_ENDPOINT && c == ElecEnergyDeviceLogic::CLUSTER.id,
                 Async(elec_energy_meas::HandlerAdaptor(&energy_handler)),
+            )
+            // Endpoint 2: the element's rating.
+            .chain(
+                |e, c| e == ELEMENT_ENDPOINT && c == desc::DescHandler::CLUSTER.id,
+                Async(desc::DescHandler::new(Dataver::new_rand(&mut weak_rand)).adapt()),
+            )
+            .chain(
+                |e, c| e == ELEMENT_ENDPOINT && c == mode_select::CLUSTER.id,
+                Async(mode_select::HandlerAdaptor(&mode_handler)),
+            )
+            .chain(
+                |e, c| e == ELEMENT_ENDPOINT && c == element::ELEMENT_WATTS_CLUSTER.id,
+                &watts_handler,
             );
 
         // Run the Matter stack with our handler. `pin!` is optional, but reduces the
@@ -325,18 +375,26 @@ async fn main(_s: Spawner) {
 
         warn!("Factory reset requested");
 
-        // Clear our own two blobs while we still hold the store handle the device
+        // Clear our own three blobs while we still hold the store handle the device
         // logic was built over.
         //
-        // This cannot ride on the `FactoryReset` lifecycle op: the EP1 cluster
-        // handlers delegate persistence to their hooks, and `ThermostatHooks` /
-        // `ElecEnergyMeasHooks` have no lifecycle method of their own. Nor does
-        // `Matter::factory_reset` do it - that only removes rs-matter's own keys,
-        // which by design grow *downwards* from `VENDOR_KEYS_START`. So this is the
-        // one place the setpoints and the lifetime energy counter get cleared.
+        // This cannot ride on the `FactoryReset` lifecycle op: our cluster handlers
+        // delegate persistence to their hooks, and `ThermostatHooks`,
+        // `ElecEnergyMeasHooks` and `ModeSelectHooks` have no lifecycle method of
+        // their own. Nor does `Matter::factory_reset` do it - that only removes
+        // rs-matter's own keys, which by design grow *downwards* from
+        // `VENDOR_KEYS_START`. So this is the one place the setpoints, the lifetime
+        // energy counter and the element rating get cleared.
+        //
+        // Clearing the rating means a reset board meters at `config.toml`'s
+        // `heater.element_watts` again, which is the right answer for the same
+        // reason the setpoints go back to their defaults: a factory reset returns
+        // the device to what it was built as, and the next owner of the fabric
+        // should not inherit the last one's calibration.
         for key in [
             vendor_kv::THERMOSTAT_STATE_KEY,
             vendor_kv::HEATING_ELEMENT_ENERGY_KEY,
+            vendor_kv::ELEMENT_RATING_KEY,
         ] {
             if let Err(e) = kv.remove_blob(key) {
                 warn!("Could not remove vendor key {key:#x}: {e}");
@@ -348,11 +406,11 @@ async fn main(_s: Spawner) {
     // borrows `stack.matter()` - is alive. Hence the scope above, and hence a
     // freshly-built handler here: the EP1 chain borrows `kv` and cannot outlive it.
     //
-    // Leaving EP1 out of this chain is sound because the only thing `reset`
+    // Leaving EP1 and EP2 out of this chain is sound because the only thing `reset`
     // does with a handler is broadcast the `FactoryReset` lifecycle op, and the
     // handlers that persist anything through it - ACL, NOC, Group Key Management,
-    // General Commissioning - all live inside `root_handler`. Our EP1 state was
-    // already removed above. Chain EP1 back in here if one of its clusters ever
+    // General Commissioning - all live inside `root_handler`. Our own state was
+    // already removed above. Chain them back in here if one of those clusters ever
     // grows `FactoryReset`-driven persistence.
     warn!("Resetting storage");
 
@@ -529,6 +587,15 @@ const NODE: Node = Node {
                 power_topology::CLUSTER,
                 ElecPwrDeviceLogic::CLUSTER,
                 ElecEnergyDeviceLogic::CLUSTER,
+            ),
+        ),
+        Endpoint::new(
+            ELEMENT_ENDPOINT,
+            devices!(DEV_TYPE_MODE_SELECT),
+            clusters!(
+                desc::DescHandler::CLUSTER,
+                mode_select::CLUSTER,
+                element::ELEMENT_WATTS_CLUSTER,
             ),
         ),
     ],

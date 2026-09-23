@@ -11,5 +11,12 @@
 //! that a runtime value could not satisfy: [`ABS_MIN_HEAT_SETPOINT`] and
 //! [`ABS_MAX_HEAT_SETPOINT`] are associated consts of `ThermostatHooks`, and
 //! [`METER_ACCURACY`] feeds the `ACCURACY` consts of both metering hooks.
+//!
+//! [`DEFAULT_ELEMENT_WATTS`] is the exception that proves it: nothing about the
+//! element's rating is `const`-bound - `MillHeater::active_power_mw` only reads it -
+//! which is what lets `element.rs` expose it over Matter and leaves this constant as
+//! the value a device with nothing stored falls back to. [`CIRCUIT_MAX_WATTS`] is the
+//! ceiling on what may be stored, and stays build-time because [`METER_ACCURACY`]'s
+//! range is built from it.
 
 include!(concat!(env!("OUT_DIR"), "/config.rs"));

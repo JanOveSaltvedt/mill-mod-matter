@@ -248,6 +248,20 @@ fn validate(config: &Config) -> Result<(), String> {
         ));
     }
 
+    // Both wattages are emitted as `u16`, because the element's rating is a runtime
+    // value the Mode Select cluster can change and the circuit maximum is the ceiling
+    // every such change is checked against. A `u16` is 65 kW of headroom over a
+    // 16 A circuit; the bound exists so the cast cannot silently wrap, not because
+    // anybody will approach it.
+    if heater.circuit_max_watts > u32::from(u16::MAX) {
+        return Err(format!(
+            "heater.circuit_max_watts ({}) is above {}, which is as much as the \
+             runtime element rating can carry",
+            heater.circuit_max_watts,
+            u16::MAX
+        ));
+    }
+
     if heater.min_setpoint_celsius >= heater.max_setpoint_celsius {
         return Err(format!(
             "heater.min_setpoint_celsius ({}) must be below heater.max_setpoint_celsius ({})",
@@ -417,7 +431,8 @@ fn emit(config: &Config) -> String {
         format!("Some({:?})", device.serial_number)
     };
 
-    let element_power_mw = i64::from(heater.element_watts) * 1000;
+    let element_watts = heater.element_watts;
+    let circuit_max_watts = heater.circuit_max_watts;
     let circuit_max_power_mw = i64::from(heater.circuit_max_watts) * 1000;
 
     let vendor_name = &device.vendor_name;
@@ -441,11 +456,21 @@ fn emit(config: &Config) -> String {
 //
 // Edit `config.toml` (or `config.local.toml`) and rebuild instead.
 
-/// The heating element's rated power, in milliwatts.
+/// The heating element's rated power in watts, as the device comes up with nothing
+/// stored.
 ///
 /// Gated on the Mill's on/off bit, this is every power and energy reading the device
-/// serves; there is no metering hardware to check it against.
-pub const ELEMENT_POWER_MW: i64 = {element_power_mw};
+/// serves; there is no metering hardware to check it against. Only the *default*,
+/// though: the Mode Select cluster on endpoint 2 can pick another rating, and what
+/// it picks is persisted and wins from then on.
+pub const DEFAULT_ELEMENT_WATTS: u16 = {element_watts};
+
+/// The most the element may be told it is rated at, in watts.
+///
+/// The ceiling on every runtime change of the rating, because the accuracy range
+/// `ElectricalPowerMeasurement` advertises is built from it: an element claiming
+/// more than this would report an `ActivePower` above its own `MaxMeasuredValue`.
+pub const CIRCUIT_MAX_WATTS: u16 = {circuit_max_watts};
 
 /// The top of the reported power range, in milliwatts.
 pub const CIRCUIT_MAX_POWER_MW: i64 = {circuit_max_power_mw};

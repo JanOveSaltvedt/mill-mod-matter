@@ -30,7 +30,7 @@ serde = { version = "1", features = ["derive"] }
 #
 # Our fork, pinned to the exact commit the firmware links (see `[patch.crates-io]`
 # below). Uncomment the `path` line instead to develop against the sibling checkout.
-rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c22fbe4a2fdc9a51c714281000f21f4224e82702", default-features = false }
+rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c6bd5e53bd369fc029169cb733184e5853eff54b", default-features = false }
 # rs-matter = { path = "../rs-matter/rs-matter", default-features = false }
 
 [dependencies]
@@ -125,7 +125,7 @@ tinyrlibc = { version = "0.5", default-features = false, features = ["memchr", "
 # those handlers lands upstream; `rs-matter-stack` is unmodified upstream, pinned to
 # the commit this was developed against. Swap in the `path` lines to develop against
 # the sibling checkouts - `../rs-matter-embassy` has a matching pair above.
-rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c22fbe4a2fdc9a51c714281000f21f4224e82702" }
+rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c6bd5e53bd369fc029169cb733184e5853eff54b" }
 rs-matter-stack = { git = "https://github.com/ivmarkov/rs-matter-stack", rev = "f3aa6091bd080e114a9d8e4e1a432e7b27365403" }
 # rs-matter = { path = "../rs-matter/rs-matter" }
 # rs-matter-stack = { path = "../rs-matter-stack" }
