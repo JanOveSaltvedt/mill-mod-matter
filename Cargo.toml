@@ -38,7 +38,8 @@ log = "0.4"
 
 # The Matter stack. `rs_matter_embassy::matter` re-exports `rs-matter` itself and
 # `rs_matter_embassy::stack` re-exports `rs-matter-stack`, so this is the only
-# Matter dependency we name.
+# Matter dependency we write code against (`rs-matter` below is named for a feature
+# flag only).
 #
 # `default-features = false` drops the default `rustcrypto` backend (Thread wants
 # `mbedtls`, which OpenThread already links) and the default `trouble` BLE host,
@@ -78,6 +79,16 @@ rs-matter-embassy = { git = "https://github.com/ivmarkov/rs-matter-embassy", rev
     "events-ringbuf-size-256",
     "groups",
 ] }
+
+# Named only to switch on a feature of the `rs-matter` the stack above already links;
+# code still goes through `rs_matter_embassy::matter`. Same git rev as the
+# `[build-dependencies]` entry and `[patch.crates-io]`: cargo insists on one source
+# per dependency name, and it has to be the one package the stack links.
+#
+# `log-mrp` raises every MRP retransmission, ack mismatch and duplicate from `debug!`
+# to `warn!`, so Thread packet loss shows on the serial log. It is chatty on a lossy
+# link - drop it once that is no longer being chased.
+rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c6bd5e53bd369fc029169cb733184e5853eff54b", default-features = false, features = ["log-mrp"] }
 
 embassy-executor = "0.10"
 embassy-embedded-hal = "0.6"

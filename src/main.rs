@@ -33,7 +33,7 @@ use core::pin::pin;
 
 use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
 
 use esp_alloc::heap_allocator;
 use esp_backtrace as _;
@@ -64,7 +64,7 @@ use rs_matter_embassy::matter::dm::clusters::identify::{self, IdentifyHandler};
 use rs_matter_embassy::matter::dm::clusters::mode_select::{self, ModeSelectHandler};
 use rs_matter_embassy::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT};
 use rs_matter_embassy::matter::dm::devices::{
-    DEV_TYPE_ELECTRICAL_SENSOR, DEV_TYPE_MODE_SELECT, DEV_TYPE_THERMOSTAT,
+    DEV_TYPE_ELECTRICAL_SENSOR, DEV_TYPE_MODE_SELECT, DEV_TYPE_ROOT_NODE, DEV_TYPE_THERMOSTAT,
 };
 use rs_matter_embassy::matter::dm::endpoints::ROOT_ENDPOINT_ID;
 use rs_matter_embassy::matter::dm::{Async, Dataver, EmptyHandler, Endpoint, Node};
@@ -83,17 +83,23 @@ use static_cell::StaticCell;
 
 use tinyrlibc as _;
 
+use crate::boot_diag::BootDiagHandler;
 use crate::element::{ElementRating, ElementWattsHandler};
 use crate::heater::MillHeater;
 use crate::meter::{ElecEnergyDeviceLogic, ElecPwrDeviceLogic};
+use crate::radio::LoggedRadio;
+use crate::supervisor::Watchdog;
 use crate::thermostat::ThermostatDeviceLogic;
 use crate::vendor_kv::VendorKv;
 
+mod boot_diag;
 mod config;
 mod element;
 mod heater;
 mod meter;
 mod mill;
+mod radio;
+mod supervisor;
 mod thermostat;
 mod vendor_kv;
 
@@ -150,6 +156,13 @@ async fn main(_s: Spawner) {
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
+    // First, before the radio is up: the brownout threshold goes over the analog
+    // I2C bus the PHY also uses, and a watchdog is no use if it starts late. From
+    // here on, something has to feed it at least every 20 s - see `supervisor.rs`.
+    supervisor::arm_brownout_reset();
+
+    let mut watchdog = Watchdog::start(peripherals.TIMG1);
+
     // Create the crypto provider, using the `esp-hal` TRNG/ADC1 as the source of
     // randomness for a reseeding CSPRNG.
     let _trng_source = esp_hal::rng::TrngSource::new(peripherals.RNG, peripherals.ADC1);
@@ -159,6 +172,9 @@ async fn main(_s: Spawner) {
     );
 
     let mut weak_rand = crypto.weak_rand().unwrap();
+
+    // Reads the reset reason, and logs it, early, while the log is still short.
+    let boot_diag = BootDiagHandler::new(Dataver::new_rand(&mut weak_rand));
 
     // Unlike the `rs-matter-embassy` examples, which randomise this per boot to
     // dodge stale SRP registrations, we derive a *stable* EUI-64 from the chip's
@@ -280,6 +296,12 @@ async fn main(_s: Spawner) {
                     &mut weak_rand,
                 )),
             )
+            // Why the board last reset. Chained after - so matched before - the
+            // catch-all EP0 matcher above, which would otherwise claim it.
+            .chain(
+                |e, c| e == ROOT_ENDPOINT_ID && c == boot_diag::BOOT_DIAG_CLUSTER_ID,
+                &boot_diag,
+            )
             // Every endpoint needs a Descriptor cluster; use the one `rs-matter`
             // provides out of the box.
             .chain(
@@ -332,9 +354,11 @@ async fn main(_s: Spawner) {
         // every handler in the chain, and each cluster handler drives its hooks'
         // `run()` from there. Hence `()` for the user task.
         let mut matter = pin!(stack.run(
-            // The Matter stack needs to instantiate an `openthread` Radio
+            // The Matter stack needs to instantiate an `openthread` Radio. Wrapped
+            // so the serial log shows whether BLE is down whenever Thread starts -
+            // see `radio.rs`.
             EmbassyThread::new(
-                EspThreadDriver::new(peripherals.IEEE802154, peripherals.BT),
+                LoggedRadio(EspThreadDriver::new(peripherals.IEEE802154, peripherals.BT)),
                 crypto.rand().unwrap(),
                 ieee_eui64,
                 &kv,
@@ -362,15 +386,22 @@ async fn main(_s: Spawner) {
         // the stack is stopped, and treating that as consent to wipe a commissioned
         // device - as the upstream example's `coalesce().unwrap()` would - is not a
         // trade anybody wants.
-        match select(&mut matter, &mut wait_reset).await {
-            Either::First(result) => {
+        //
+        // The watchdog is fed from the same `select`, so the same task polls it.
+        // Anything that stops this task being polled - a future blocking the CPU, a
+        // panic halting it - stops the feeding too.
+        watchdog.feed();
+
+        match select3(&mut matter, &mut wait_reset, watchdog.run()).await {
+            Either3::First(result) => {
                 result.unwrap();
 
                 warn!("Matter stack stopped; rebooting without touching storage");
 
                 esp_hal::system::software_reset()
             }
-            Either::Second(result) => result.unwrap(),
+            Either3::Second(result) => result.unwrap(),
+            Either3::Third(never) => match never {},
         }
 
         warn!("Factory reset requested");
@@ -421,6 +452,10 @@ async fn main(_s: Spawner) {
             &mut weak_rand,
         )),
     );
+
+    // Erasing the `nvs` range blocks for a few seconds at most, well inside the
+    // watchdog's timeout - but only if the count starts from zero here.
+    watchdog.feed();
 
     stack
         .reset(&crypto, (NODE, &reset_handler), &mut store)
@@ -575,7 +610,17 @@ fn dev_comm() -> BasicCommData {
 /// than needing a second.
 const NODE: Node = Node {
     endpoints: &[
-        EmbassyThreadMatterStack::<0, ()>::root_endpoint(),
+        // `EmbassyThreadMatterStack::root_endpoint()`, spelled out - it is
+        // `root_endpoint!(thread)` - so that `boot_diag.rs`'s cluster can join the
+        // system clusters. `clusters!` takes extra ones after the `;`.
+        Endpoint {
+            id: ROOT_ENDPOINT_ID,
+            device_types: devices!(DEV_TYPE_ROOT_NODE),
+            clusters: clusters!(thread; boot_diag::BOOT_DIAG_CLUSTER),
+            client_clusters: &[],
+            unique_id: None,
+            semantic_tags: &[],
+        },
         Endpoint::new(
             THERMOSTAT_ENDPOINT,
             devices!(DEV_TYPE_THERMOSTAT, DEV_TYPE_ELECTRICAL_SENSOR),
@@ -600,6 +645,48 @@ const NODE: Node = Node {
         ),
     ],
 };
+
+/// Whether `NODE`'s root endpoint is still the stack's own plus `boot_diag.rs`'s
+/// cluster at the end - that is, whether spelling it out has not drifted from
+/// `root_endpoint()` since `rs-matter-stack` last moved.
+const fn root_endpoint_matches_stack() -> bool {
+    let stack = EmbassyThreadMatterStack::<0, ()>::root_endpoint();
+    let ours = &NODE.endpoints[0];
+
+    if ours.id != stack.id
+        || ours.device_types.len() != stack.device_types.len()
+        || ours.clusters.len() != stack.clusters.len() + 1
+        || ours.clusters[stack.clusters.len()].id != boot_diag::BOOT_DIAG_CLUSTER_ID
+    {
+        return false;
+    }
+
+    let mut i = 0;
+
+    while i < stack.device_types.len() {
+        if ours.device_types[i].dtype != stack.device_types[i].dtype {
+            return false;
+        }
+
+        i += 1;
+    }
+
+    let mut i = 0;
+
+    while i < stack.clusters.len() {
+        let (a, b) = (&ours.clusters[i], &stack.clusters[i]);
+
+        if a.id != b.id || a.revision != b.revision || a.feature_map != b.feature_map {
+            return false;
+        }
+
+        i += 1;
+    }
+
+    true
+}
+
+const _: () = assert!(root_endpoint_matches_stack());
 
 /// Derive a stable IEEE 802.15.4 extended address from the chip's factory MAC-48.
 ///

@@ -118,7 +118,13 @@ src/main.rs        stack wiring, the `NODE` metadata, the handler chain, NVS sto
 src/mill.rs        the wire protocol: framing, checksum, the status frame, the two
                    command frames. Pure logic, no peripherals.
 src/heater.rs      MillHeater: the UART halves, the state the Mill reports, the energy
-                   counters. The ONLY module that touches hardware.
+                   counters. The only module that touches the Mill's peripherals.
+src/supervisor.rs  the chip's own reset machinery: reset reason, brownout detector,
+                   TIMG1 watchdog. The only other module that touches hardware.
+src/boot_diag.rs   a manufacturer-specific cluster on EP0 serving why the board last
+                   reset (`BootReason`, `ResetCause`)
+src/radio.rs       LoggedRadio: wraps `EspThreadDriver` to log when the BLE controller
+                   and Thread come up and go down. Delegates; touches no hardware
 src/thermostat.rs  ThermostatHooks - heating-only, setpoints persisted, no control
                    loop (the Mill owns that)
 src/meter.rs       ElecPwrMeasHooks + ElecEnergyMeasHooks - what the element draws
@@ -262,6 +268,28 @@ None of these is obvious from the code.
   commissioner. Those two are also all it takes to produce the printed QR and manual
   codes without a board, which is what `build.rs` writes into `commissioning/` - how a
   board sealed inside a heater gets commissioned.
+- **The watchdog is fed from the main `select`, not from a task of its own.**
+  `supervisor::Watchdog::run` sits in the same `select3` as `stack.run`, so it is
+  polled only while the one executor task is. That makes it a *stall* detector: a
+  future that blocks the CPU for 20 s, or a panic (`esp-backtrace` ends in
+  `loop {}`), resets the board and reads back as `HardwareWatchdogReset`. It
+  catches nothing that is merely stuck awaiting, and nothing blocks for anywhere near 20 s
+  on purpose. Keep it that way: a new blocking path longer than a few seconds, like
+  a bigger `nvs` erase, has to feed it first, as the factory-reset path does.
+- **`PowerOnReboot` does not prove a power cycle.** The ESP-IDF bootloader arms the
+  C6's *analog* brownout reset (BOD mode 1), and that one is a chip reset recorded
+  as `0x01`, the same as a power-on. `supervisor::arm_brownout_reset` turns it off
+  and arms the digital detector (mode 0) for a *system* reset, recorded as
+  `SysBrownOut` (`0x0F`), exactly as ESP-IDF's own `esp_brownout_init` does. Until
+  that runs, and on the first boot after flashing over firmware without it, a brownout still
+  reads as a power-on.
+- **`BootReason` is ours, not General Diagnostics'.** The standard attribute exists
+  (`0x0004`, optional), but `rs-matter-stack` chains General Diagnostics itself and
+  hands it `&()` as its `GenDiag`, so there is no way in without forking the stack.
+  `boot_diag.rs` serves the same enum from `0xFFF1FC02` on EP0 instead. That is also
+  why `NODE` spells EP0 out rather than calling `root_endpoint()`:
+  `root_endpoint_matches_stack` const-asserts that the two still agree when
+  `rs-matter-stack` moves.
 - **The device is uncertified.** It ships `rs-matter`'s test DAC/PAI and the CSA test
   VID/PID, so every commissioner warns about it. Expected on a private fabric.
 
@@ -348,7 +376,8 @@ None of these is obvious from the code.
   subscriptions, KV scratch buffer). Don't raise a number in code; pick the feature.
 - Logging is plain `log::{info, warn, error}` - this is a downstream crate, so
   `rs-matter`'s internal `crate::fmt` rule does not apply.
-- Keep `heater.rs` the only module that touches a peripheral. If a change to
-  `thermostat.rs` or `meter.rs` starts wanting one, put it behind a `heater.rs`
-  method instead. Protocol logic belongs in `mill.rs`, which stays free of
+- Keep `heater.rs` the only module that touches the Mill's peripherals, and
+  `supervisor.rs` the only one that touches the chip's reset machinery. If a change
+  to `thermostat.rs` or `meter.rs` starts wanting a peripheral, put it behind a
+  method in one of those instead. Protocol logic belongs in `mill.rs`, which stays free of
   `esp-hal` so it can be reasoned about (and `const`-asserted) on its own.
