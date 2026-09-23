@@ -29,7 +29,6 @@ use rs_matter_embassy::matter::dm::clusters::app::measurement::{
 };
 use rs_matter_embassy::matter::dm::clusters::decl::globals::MeasurementTypeEnum;
 use rs_matter_embassy::matter::dm::Cluster;
-use rs_matter_embassy::matter::tlv::Nullable;
 use rs_matter_embassy::matter::with;
 
 use crate::heater::{MillHeater, ENERGY_PERIOD, METER_TICK};
@@ -112,8 +111,8 @@ impl ElecPwrMeasHooks for ElecPwrDeviceLogic<'_> {
     /// One entry, for the one reading served.
     const ACCURACY: &'static [MeasurementAccuracy] = &[meter_accuracy!(ActivePower, MAX_POWER_MW)];
 
-    fn active_power(&self) -> Nullable<i64> {
-        Nullable::some(self.heater.active_power_mw())
+    fn active_power(&self) -> Option<i64> {
+        Some(self.heater.active_power_mw())
     }
 
     async fn run<F: Fn(elec_pwr_meas::OutOfBandMessage)>(&self, notify: F) {

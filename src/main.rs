@@ -51,11 +51,11 @@ use log::{info, warn};
 use rs_matter_embassy::matter::crypto::{default_crypto, Crypto};
 use rs_matter_embassy::matter::dm::clusters::app::elec_energy_meas::{self, ElecEnergyMeasHooks};
 use rs_matter_embassy::matter::dm::clusters::app::elec_pwr_meas::{self, ElecPwrMeasHooks};
-// Aliased: the local `thermostat` module below holds our device logic, and
-// `HandlerAsyncAdaptor` is a name every generated cluster module exports.
 use rs_matter_embassy::matter::dm::clusters::app::power_topology::{self, PowerTopologyHandler};
+// Aliased: the local `thermostat` module below holds our device logic, and
+// `HandlerAdaptor` is a name every generated cluster module exports.
 use rs_matter_embassy::matter::dm::clusters::app::thermostat::{
-    HandlerAsyncAdaptor as ThermostatHandlerAdaptor, ThermostatHandler, ThermostatHooks,
+    HandlerAdaptor as ThermostatHandlerAdaptor, ThermostatHandler, ThermostatHooks,
 };
 use rs_matter_embassy::matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter_embassy::matter::dm::clusters::desc::{self, ClusterHandler as _};
@@ -232,16 +232,16 @@ async fn main(_s: Spawner) {
         let kv = stack.matter().kv(&mut store);
 
         // The heater, and the three cluster device-logic structs that share it. The
-        // heater and the thermostat logic re-hydrate their persisted state from `kv`
-        // as they are built - the two meters have none of their own, they just read
-        // the heater. Loading here rather than later matters: it has to happen before
-        // the `Startup` lifecycle op reaches the handlers, because that is where the
-        // Thermostat handler validates and repairs what we just loaded.
+        // heater re-hydrates its energy counter from `kv` as it is built; the two
+        // meters have no state of their own, they just read the heater. The
+        // Thermostat handler persists its attributes itself, under the key given
+        // here, and restores and repairs them when `Startup` reaches it.
         let heater = MillHeater::new(&kv, mill_uart);
 
         let thermostat_handler = ThermostatHandler::new(
             Dataver::new_rand(&mut weak_rand),
             THERMOSTAT_ENDPOINT,
+            vendor_kv::THERMOSTAT_ATTRS_KEY,
             ThermostatDeviceLogic::new(&kv, &heater),
         );
 
@@ -260,9 +260,10 @@ async fn main(_s: Spawner) {
         );
 
         // The element's rating, and the two clusters that set it. Built after the
-        // heater and before the stack runs: its constructor pushes the restored
-        // rating onto the heater, and `ModeSelectHandler` validates the mode table
-        // and repairs a stale `CurrentMode` when `Startup` reaches it.
+        // heater and before the stack runs: its constructor pushes the default
+        // rating onto the heater, and `ModeSelectHandler` validates the mode table,
+        // restores `CurrentMode` and repairs a stale one when `Startup` reaches it.
+        // `ElementWattsHandler::run` then brings the rating in line with it.
         //
         // Both handlers borrow the rating rather than owning it, which is what keeps
         // the two clusters one value. Unlike `ElecEnergyMeasHooks` - see the note on
@@ -270,7 +271,11 @@ async fn main(_s: Spawner) {
         // forwards every method, so `&ElementRating` is a complete hooks impl.
         let rating = ElementRating::new(&kv, &heater);
 
-        let mode_handler = ModeSelectHandler::new(Dataver::new_rand(&mut weak_rand), &rating);
+        let mode_handler = ModeSelectHandler::new(
+            Dataver::new_rand(&mut weak_rand),
+            vendor_kv::ELEMENT_MODE_KEY,
+            &rating,
+        );
 
         // Borrows `mode_handler` so that writing an exact wattage moves `CurrentMode`
         // through the cluster that owns it, and subscribers hear about it.
@@ -318,7 +323,7 @@ async fn main(_s: Spawner) {
             )
             .chain(
                 |e, c| e == THERMOSTAT_ENDPOINT && c == ThermostatDeviceLogic::CLUSTER.id,
-                ThermostatHandlerAdaptor(&thermostat_handler),
+                Async(ThermostatHandlerAdaptor(&thermostat_handler)),
             )
             .chain(
                 |e, c| e == THERMOSTAT_ENDPOINT && c == power_topology::CLUSTER.id,
@@ -406,16 +411,16 @@ async fn main(_s: Spawner) {
 
         warn!("Factory reset requested");
 
-        // Clear our own three blobs while we still hold the store handle the device
+        // Clear the vendor keys while we still hold the store handle the device
         // logic was built over.
         //
-        // This cannot ride on the `FactoryReset` lifecycle op: our cluster handlers
-        // delegate persistence to their hooks, and `ThermostatHooks`,
-        // `ElecEnergyMeasHooks` and `ModeSelectHooks` have no lifecycle method of
-        // their own. Nor does `Matter::factory_reset` do it - that only removes
-        // rs-matter's own keys, which by design grow *downwards* from
-        // `VENDOR_KEYS_START`. So this is the one place the setpoints, the lifetime
-        // energy counter and the element rating get cleared.
+        // The Thermostat and Mode Select handlers would clear their own on the
+        // `FactoryReset` lifecycle op, but the reset below cannot chain them - see
+        // the comment there - and `ElecEnergyMeasHooks` has no lifecycle method at
+        // all. Nor does `Matter::factory_reset` do it - that only removes rs-matter's
+        // own keys, which by design grow *downwards* from `VENDOR_KEYS_START`. So
+        // this is the one place the setpoints, the lifetime energy counter and the
+        // element rating get cleared.
         //
         // Clearing the rating means a reset board meters at `config.toml`'s
         // `heater.element_watts` again, which is the right answer for the same
@@ -423,9 +428,10 @@ async fn main(_s: Spawner) {
         // the device to what it was built as, and the next owner of the fabric
         // should not inherit the last one's calibration.
         for key in [
-            vendor_kv::THERMOSTAT_STATE_KEY,
             vendor_kv::HEATING_ELEMENT_ENERGY_KEY,
             vendor_kv::ELEMENT_RATING_KEY,
+            vendor_kv::THERMOSTAT_ATTRS_KEY,
+            vendor_kv::ELEMENT_MODE_KEY,
         ] {
             if let Err(e) = kv.remove_blob(key) {
                 warn!("Could not remove vendor key {key:#x}: {e}");
@@ -438,11 +444,10 @@ async fn main(_s: Spawner) {
     // freshly-built handler here: the EP1 chain borrows `kv` and cannot outlive it.
     //
     // Leaving EP1 and EP2 out of this chain is sound because the only thing `reset`
-    // does with a handler is broadcast the `FactoryReset` lifecycle op, and the
-    // handlers that persist anything through it - ACL, NOC, Group Key Management,
-    // General Commissioning - all live inside `root_handler`. Our own state was
-    // already removed above. Chain them back in here if one of those clusters ever
-    // grows `FactoryReset`-driven persistence.
+    // does with a handler is broadcast the `FactoryReset` lifecycle op, and all the
+    // EP1/EP2 handlers would do with it is remove their own keys - which the loop
+    // above has already done. Everything else that persists through it - ACL, NOC,
+    // Group Key Management, General Commissioning - lives inside `root_handler`.
     warn!("Resetting storage");
 
     let reset_handler = EmptyHandler.chain(

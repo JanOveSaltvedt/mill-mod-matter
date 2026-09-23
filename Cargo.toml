@@ -28,9 +28,9 @@ harness = false
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 #
-# Our fork, pinned to the exact commit the firmware links (see `[patch.crates-io]`
+# Upstream, pinned to the exact commit the firmware links (see `[patch.crates-io]`
 # below). Uncomment the `path` line instead to develop against the sibling checkout.
-rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c6bd5e53bd369fc029169cb733184e5853eff54b", default-features = false }
+rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "e77965edaec25ac5e75ef19234aae96be3653530", default-features = false }
 # rs-matter = { path = "../rs-matter/rs-matter", default-features = false }
 
 [dependencies]
@@ -88,7 +88,7 @@ rs-matter-embassy = { git = "https://github.com/ivmarkov/rs-matter-embassy", rev
 # `log-mrp` raises every MRP retransmission, ack mismatch and duplicate from `debug!`
 # to `warn!`, so Thread packet loss shows on the serial log. It is chatty on a lossy
 # link - drop it once that is no longer being chased.
-rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c6bd5e53bd369fc029169cb733184e5853eff54b", default-features = false, features = ["log-mrp"] }
+rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "e77965edaec25ac5e75ef19234aae96be3653530", default-features = false, features = ["log-mrp"] }
 
 embassy-executor = "0.10"
 embassy-embedded-hal = "0.6"
@@ -127,16 +127,16 @@ tinyrlibc = { version = "0.5", default-features = false, features = ["memchr", "
 [patch.crates-io]
 # The whole point of these two: `rs-matter-embassy` depends on `rs-matter-stack`
 # from crates.io, which in turn depends on `rs-matter` from crates.io - and we need
-# our fork of `rs-matter`, which carries the Thermostat and Electrical Sensor
+# an unreleased `rs-matter`, the first to carry the Thermostat and Electrical Sensor
 # cluster handlers. Version `0.4.1` satisfies the `^0.4` that `rs-matter-stack`
 # asks for, so no version surgery is needed.
 #
 # Both are pinned to a commit rather than a branch, so a checkout builds the same
-# graph a year from now. `rs-matter` is our fork and stays one until the PR adding
-# those handlers lands upstream; `rs-matter-stack` is unmodified upstream, pinned to
-# the commit this was developed against. Swap in the `path` lines to develop against
+# graph a year from now. Both are unmodified upstream, pinned to the commit this was
+# developed against; `rs-matter` can go back to a plain crates.io version once a
+# release carries those handlers. Swap in the `path` lines to develop against
 # the sibling checkouts - `../rs-matter-embassy` has a matching pair above.
-rs-matter = { git = "https://github.com/JanOveSaltvedt/rs-matter", rev = "c6bd5e53bd369fc029169cb733184e5853eff54b" }
+rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "e77965edaec25ac5e75ef19234aae96be3653530" }
 rs-matter-stack = { git = "https://github.com/ivmarkov/rs-matter-stack", rev = "f3aa6091bd080e114a9d8e4e1a432e7b27365403" }
 # rs-matter = { path = "../rs-matter/rs-matter" }
 # rs-matter-stack = { path = "../rs-matter-stack" }

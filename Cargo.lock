@@ -297,11 +297,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "211713d2e9fb4793ce4360a712c0764264aff6be48932ccf02ca2a331c0436a9"
 dependencies = [
  "btuuid",
- "embassy-sync 0.8.0",
+ "embassy-sync 0.7.2",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "futures-intrusive",
- "heapless 0.9.3",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -311,11 +311,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f3c66fd0a41a3b3a5906847b1bf5516048ce083e24fa9341a0fa31d3b4cd73d"
 dependencies = [
  "btuuid",
- "embassy-sync 0.8.0",
+ "embassy-sync 0.7.2",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "futures-intrusive",
- "heapless 0.9.3",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -326,11 +326,11 @@ checksum = "f63b3d6f0ef006d9b87a075705d6c142b03681ad34090659647f0e227c1c667f"
 dependencies = [
  "bt-hci-transport",
  "btuuid",
- "embassy-sync 0.8.0",
+ "embassy-sync 0.7.2",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "futures-intrusive",
- "heapless 0.9.3",
+ "heapless 0.8.0",
  "log",
 ]
 
@@ -3544,7 +3544,7 @@ dependencies = [
 [[package]]
 name = "rs-matter"
 version = "0.4.1"
-source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c6bd5e53bd369fc029169cb733184e5853eff54b#c6bd5e53bd369fc029169cb733184e5853eff54b"
+source = "git+https://github.com/project-chip/rs-matter?rev=e77965edaec25ac5e75ef19234aae96be3653530#e77965edaec25ac5e75ef19234aae96be3653530"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
@@ -3580,7 +3580,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-codegen"
 version = "0.4.1"
-source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c6bd5e53bd369fc029169cb733184e5853eff54b#c6bd5e53bd369fc029169cb733184e5853eff54b"
+source = "git+https://github.com/project-chip/rs-matter?rev=e77965edaec25ac5e75ef19234aae96be3653530#e77965edaec25ac5e75ef19234aae96be3653530"
 dependencies = [
  "convert_case 0.6.0",
  "miette",
@@ -3634,7 +3634,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-macros"
 version = "0.4.1"
-source = "git+https://github.com/JanOveSaltvedt/rs-matter?rev=c6bd5e53bd369fc029169cb733184e5853eff54b#c6bd5e53bd369fc029169cb733184e5853eff54b"
+source = "git+https://github.com/project-chip/rs-matter?rev=e77965edaec25ac5e75ef19234aae96be3653530#e77965edaec25ac5e75ef19234aae96be3653530"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

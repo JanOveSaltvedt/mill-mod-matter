@@ -19,9 +19,10 @@
 //!   list. No controller has a UI for it - it is reached with `chip-tool
 //!   write-by-id` or the equivalent - which is fine for something set once per unit.
 //!
-//! [`ElementRating`] is the single piece of state behind both, and
-//! [`CUSTOM_MODE`] is what keeps them honest: `CurrentMode` is mandatory and must
-//! always name a supported mode, so "somebody wrote an exact figure" has to be
+//! [`ElementRating`] is the single piece of state behind both - `CurrentMode` itself
+//! is owned and persisted by `rs-matter`'s `ModeSelectHandler`, and mirrored there -
+//! and [`CUSTOM_MODE`] is what keeps them honest: `CurrentMode` is mandatory and
+//! must always name a supported mode, so "somebody wrote an exact figure" has to be
 //! *sayable* in the mode list. Writing `ElementWatts` therefore switches
 //! `CurrentMode` to `Custom`, and the select entity reads "Custom" instead of
 //! silently disagreeing with the meter.
@@ -94,8 +95,10 @@ const CUSTOM_TAG: u16 = 0;
 /// [`CUSTOM_MODE`] is for, so the list being incomplete costs a user one extra step
 /// rather than locking them out.
 ///
-/// **Mode values are persisted, so they may never be renumbered.** Appending a
-/// rating is free; changing what an existing id means would silently re-rate every
+/// **Mode values are persisted, so they may never be renumbered.**
+/// `ModeSelectHandler` keeps `CurrentMode` under
+/// [`ELEMENT_MODE_KEY`](crate::vendor_kv::ELEMENT_MODE_KEY). Appending a rating is
+/// free; changing what an existing id means would silently re-rate every
 /// device already storing it. Dropping one is survivable - `ModeSelectHandler`
 /// repairs a `CurrentMode` that is no longer in the table by switching to the first
 /// entry, which is why the first entry is the *lowest* rating: a device that lands
@@ -162,6 +165,29 @@ const _: () = assert!(MODES[0].id != CUSTOM_MODE);
 // `watts_of` distinguishes the two by `CUSTOM_MODE` alone, so the custom entry must
 // not also look like a rating of `CUSTOM_TAG` watts.
 const _: () = assert!(CUSTOM_TAG == 0);
+
+/// What a device with nothing stored comes up with: whatever `config.toml` was built
+/// with, expressed as a listed mode where one matches and as [`CUSTOM_MODE`] where
+/// none does - in which case [`ElementRating`]'s custom figure defaults to the same
+/// wattage.
+///
+/// So `heater.element_watts` keeps working exactly as it did for anybody who never
+/// touches either cluster - including for a rating that is not on the list, which is
+/// the case that would otherwise be a regression.
+const fn default_mode() -> ModeId {
+    let mut i = 0;
+
+    while i < MODES.len() {
+        // `tags[0]` cannot panic: `modes_are_well_formed` has already been asserted.
+        if MODES[i].id != CUSTOM_MODE && MODES[i].tags[0].value == DEFAULT_ELEMENT_WATTS {
+            return MODES[i].id;
+        }
+
+        i += 1;
+    }
+
+    CUSTOM_MODE
+}
 
 /// What `Description` reports: what this Mode Select instance selects.
 ///
@@ -236,57 +262,29 @@ fn watts_of(mode: ModeId) -> Option<u16> {
         .map(|tag| tag.value)
 }
 
-/// The two fields behind both clusters, as three bytes: [`ModeId`] then the custom
-/// wattage as a little-endian `u16`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PersistentState {
-    mode: ModeId,
-    custom_watts: u16,
-}
+/// What [`ELEMENT_RATING_KEY`] holds: the custom wattage as a little-endian `u16`.
+///
+/// `CurrentMode` is not in it - `ModeSelectHandler` persists that under a key of its
+/// own. Firmware from before that kept both here, as three bytes with the mode
+/// first; [`ElementWattsHandler::run`] hands such a mode over to the handler once,
+/// and the blob is rewritten in the current form.
+const RATING_LEN: usize = 2;
 
-impl PersistentState {
-    const LEN: usize = 3;
-
-    fn to_bytes(self) -> [u8; Self::LEN] {
-        let watts = self.custom_watts.to_le_bytes();
-
-        [self.mode, watts[0], watts[1]]
-    }
-
-    fn from_bytes(bytes: &[u8; Self::LEN]) -> Self {
-        Self {
-            mode: bytes[0],
-            custom_watts: u16::from_le_bytes([bytes[1], bytes[2]]),
-        }
-    }
-}
-
-impl Default for PersistentState {
-    /// What a device with nothing stored comes up with: whatever `config.toml` was
-    /// built with, expressed as a listed mode where one matches and as
-    /// [`CUSTOM_MODE`] where none does.
-    ///
-    /// So `heater.element_watts` keeps working exactly as it did for anybody who
-    /// never touches either cluster - including for a rating that is not on the
-    /// list, which is the case that would otherwise be a regression.
-    fn default() -> Self {
-        Self {
-            mode: MODES
-                .iter()
-                .find(|entry| entry.tags.first().map(|t| t.value) == Some(DEFAULT_ELEMENT_WATTS))
-                .map_or(CUSTOM_MODE, |entry| entry.id),
-            // Set either way, so that picking `Custom` without ever writing the
-            // attribute gives the configured rating rather than nothing.
-            custom_watts: DEFAULT_ELEMENT_WATTS,
-        }
-    }
-}
+/// The length of the older, mode-carrying blob.
+const LEGACY_RATING_LEN: usize = 3;
 
 /// What the heating element is rated at: the state behind the Mode Select cluster
 /// and the manufacturer-specific one alike.
 pub struct ElementRating<'a> {
+    /// `CurrentMode` as `ModeSelectHandler` last had it. The handler owns the
+    /// attribute; this is kept in step through [`ModeSelectHooks::change_to_mode`]
+    /// and, for the value it restores at `Startup` without calling that, through
+    /// [`Self::adopt_mode`].
     mode: Cell<ModeId>,
     custom_watts: Cell<u16>,
+    /// A `CurrentMode` found in an older firmware's blob, awaiting handover to the
+    /// handler - see [`LEGACY_RATING_LEN`].
+    legacy_mode: Cell<Option<ModeId>>,
     /// The heater this rating meters. Every change is pushed here, because
     /// `MillHeater::active_power_mw` is what the Electrical Power and Electrical
     /// Energy Measurement clusters actually read.
@@ -295,52 +293,47 @@ pub struct ElementRating<'a> {
 }
 
 impl<'a> ElementRating<'a> {
-    /// Restore the rating from `kv` and push it onto `heater`.
+    /// Restore the custom rating from `kv` and push the default rating onto
+    /// `heater`.
     ///
-    /// Built before the Matter stack runs, like the thermostat's state and for the
-    /// same reason: the `Startup` lifecycle op reaches `ModeSelectHandler::validate`
-    /// and `repair_current_mode`, which need something to validate.
+    /// The mode in force is not known until `ModeSelectHandler` has restored it at
+    /// `Startup`; [`ElementWattsHandler::run`] adopts it from there. Until then the
+    /// heater meters at [`ModeSelectHooks::CURRENT_MODE`] - which is to say at
+    /// `config.toml`'s rating - and the Mill has not been heard from yet anyway.
     pub fn new(kv: &'a dyn VendorKv, heater: &'a MillHeater<'a>) -> Self {
-        let mut buf = [0u8; PersistentState::LEN];
+        let mut buf = [0u8; LEGACY_RATING_LEN];
 
-        let stored = match kv.load_blob(ELEMENT_RATING_KEY, &mut buf) {
-            Ok(Some(PersistentState::LEN)) => PersistentState::from_bytes(&buf),
-            _ => PersistentState::default(),
+        let (legacy_mode, stored) = match kv.load_blob(ELEMENT_RATING_KEY, &mut buf) {
+            Ok(Some(RATING_LEN)) => (None, u16::from_le_bytes([buf[0], buf[1]])),
+            Ok(Some(LEGACY_RATING_LEN)) => (Some(buf[0]), u16::from_le_bytes([buf[1], buf[2]])),
+            _ => (None, DEFAULT_ELEMENT_WATTS),
         };
 
-        // The blob predates the running firmware, so neither field can be trusted to
-        // still mean something: a mode may have been dropped from `MODES`, and a
-        // custom wattage may be above a `circuit_max_watts` that has since been
-        // lowered. Either way the configured default is a better answer than a
-        // reading nobody can justify.
+        // The blob predates the running firmware, so the custom wattage may be above
+        // a `circuit_max_watts` that has since been lowered. The configured default
+        // is a better answer than a reading nobody can justify.
         //
-        // A mode that is merely *unknown* is left alone rather than corrected here -
-        // `ModeSelectHandler::repair_current_mode` does that at `Startup`, and doing
-        // it twice would only disagree with it.
-        let custom_watts = if (1..=CIRCUIT_MAX_WATTS).contains(&stored.custom_watts) {
-            stored.custom_watts
+        // A legacy mode that is merely *unknown* is left alone rather than corrected
+        // here - `ModeSelectHandler::apply_mode` refuses it when it is handed over,
+        // and the handler's own `CurrentMode` stands.
+        let custom_watts = if (1..=CIRCUIT_MAX_WATTS).contains(&stored) {
+            stored
         } else {
             warn!(
-                "Element: stored custom rating {} W is outside 1..={CIRCUIT_MAX_WATTS} W; \
-                 falling back to {DEFAULT_ELEMENT_WATTS} W",
-                stored.custom_watts
+                "Element: stored custom rating {stored} W is outside 1..={CIRCUIT_MAX_WATTS} W; \
+                 falling back to {DEFAULT_ELEMENT_WATTS} W"
             );
 
             DEFAULT_ELEMENT_WATTS
         };
 
         let rating = Self {
-            mode: Cell::new(stored.mode),
+            mode: Cell::new(Self::CURRENT_MODE),
             custom_watts: Cell::new(custom_watts),
+            legacy_mode: Cell::new(legacy_mode),
             heater,
             kv,
         };
-
-        info!(
-            "Element: rating restored as mode {} ({} W)",
-            rating.mode.get(),
-            rating.effective_watts()
-        );
 
         rating.apply();
 
@@ -362,15 +355,23 @@ impl<'a> ElementRating<'a> {
         }
     }
 
+    /// Adopt the `CurrentMode` the handler restored, and meter at it.
+    fn adopt_mode(&self, mode: ModeId) {
+        self.mode.set(mode);
+        self.apply();
+
+        info!(
+            "Element: rating restored as mode {mode} ({} W)",
+            self.effective_watts()
+        );
+    }
+
     /// Set the exact rating, returning whether `CurrentMode` now has to move to
     /// [`CUSTOM_MODE`].
     ///
     /// The caller does that move through `ModeSelectHandler::apply_mode`, which is
     /// what notifies subscribers of the new `CurrentMode` - and which lands back in
-    /// [`ModeSelectHooks::change_to_mode`] below, where the push and the flash write
-    /// happen. That is the whole reason this does not persist in that case: one
-    /// write covers both fields, and a `store_blob` stops the radio and the Mill
-    /// UART while it runs.
+    /// [`ModeSelectHooks::change_to_mode`] below, where the push happens.
     pub fn set_custom_watts(&self, watts: u16) -> Result<bool, Error> {
         // Checked before anything is mutated, so a rejected write leaves no trace.
         if !(1..=CIRCUIT_MAX_WATTS).contains(&watts) {
@@ -382,11 +383,16 @@ impl<'a> ElementRating<'a> {
         self.custom_watts.set(watts);
 
         if self.mode.get() == CUSTOM_MODE {
+            // In this order: the heater has to be metering at the new rating before
+            // the rating is committed to flash, or an unclean power-off in between
+            // would leave the two disagreeing.
             self.apply();
             self.save_state();
 
             return Ok(false);
         }
+
+        self.save_state();
 
         Ok(true)
     }
@@ -397,12 +403,9 @@ impl<'a> ElementRating<'a> {
     }
 
     fn save_state(&self) {
-        let state = PersistentState {
-            mode: self.mode.get(),
-            custom_watts: self.custom_watts.get(),
-        };
+        let bytes = self.custom_watts.get().to_le_bytes();
 
-        if let Err(e) = self.kv.store_blob(ELEMENT_RATING_KEY, &state.to_bytes()) {
+        if let Err(e) = self.kv.store_blob(ELEMENT_RATING_KEY, &bytes) {
             error!("Element: could not persist the element rating: {e}");
         }
     }
@@ -418,6 +421,8 @@ impl ModeSelectHooks for ElementRating<'_> {
     /// a reboot as before it.
     const CLUSTER: Cluster<'static> = mode_select::CLUSTER;
 
+    const CURRENT_MODE: ModeId = default_mode();
+
     fn description(&self) -> &str {
         DESCRIPTION
     }
@@ -426,11 +431,7 @@ impl ModeSelectHooks for ElementRating<'_> {
         MODES
     }
 
-    fn current_mode(&self) -> ModeId {
-        self.mode.get()
-    }
-
-    /// Adopt `mode` and meter the element at what it says.
+    /// Adopt `mode` and meter the element at what it says. The handler persists it.
     ///
     /// The handler has already checked that `mode` is in [`MODES`] and differs from
     /// the current one, so the only thing left to refuse is a listed rating above
@@ -449,12 +450,7 @@ impl ModeSelectHooks for ElementRating<'_> {
         }
 
         self.mode.set(mode);
-
-        // In this order: the heater has to be metering at the new rating before the
-        // rating is committed to flash, or an unclean power-off in between would
-        // leave the two disagreeing.
         self.apply();
-        self.save_state();
 
         Ok(())
     }
@@ -547,7 +543,8 @@ impl AsyncHandler for ElementWattsHandler<'_> {
 
                 if switching {
                     // Lands in `change_to_mode` above, which adopts the figure just
-                    // stored, pushes it onto the heater and persists both fields.
+                    // stored and pushes it onto the heater; the handler persists the
+                    // mode.
                     // `apply_mode` cannot fail here: `CUSTOM_MODE` is in `MODES` and
                     // carries no rating of its own to be out of range.
                     self.mode
@@ -584,13 +581,41 @@ impl AsyncHandler for ElementWattsHandler<'_> {
     /// So it is sampled, for the same reason and in the same shape as
     /// `ElecPwrMeasHooks::run` in `meter.rs`: the value it watches changes only when
     /// a human changes it, so the tick can be slow and is nearly always a no-op.
+    ///
+    /// It is also where the rating learns which mode is in force at all. The
+    /// `Startup` lifecycle op is where `ModeSelectHandler` restores `CurrentMode`,
+    /// and it does so without calling the hooks; the Interaction Model has finished
+    /// `Startup` before it polls any `run`, whatever order the chain is in.
     async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
+        self.rating.adopt_mode(self.mode.current_mode());
+
+        // An older firmware's mode, handed over once - see `LEGACY_RATING_LEN`.
+        //
+        // Rewriting the blob in the current form drops that mode, so it waits for
+        // the first tick: `RATING_POLL` is longer than the handler's persist delay,
+        // and a power cut before then just migrates again on the next boot.
+        let mut migrating = if let Some(mode) = self.rating.legacy_mode.take() {
+            info!("Element: moving mode {mode} into the Mode Select handler's store");
+
+            if let Err(e) = self.mode.apply_mode(mode, self.endpoint, &ctx) {
+                warn!("Element: could not restore the pre-upstream mode {mode}: {e}");
+            }
+
+            true
+        } else {
+            false
+        };
+
         let mut reported = self.rating.effective_watts();
 
         // Never returns. `ChainedHandler::run` selects over every handler's `run`, so
         // one that finishes would end the whole chain.
         loop {
             embassy_time::Timer::after(RATING_POLL).await;
+
+            if core::mem::take(&mut migrating) {
+                self.rating.save_state();
+            }
 
             let watts = self.rating.effective_watts();
 

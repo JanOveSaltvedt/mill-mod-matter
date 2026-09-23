@@ -25,30 +25,26 @@ This crate only builds inside a checkout that has its three siblings next to it:
 ```
 workspace/iot/
   mill-mod-matter/    <- here
-  rs-matter/          FORK, branch `feature/thermostat-energy-metering`
+  rs-matter/          upstream main (project-chip/rs-matter)
   rs-matter-stack/    unmodified upstream master
   rs-matter-embassy/  unmodified upstream master
   connectedhomeip/    the CSA SDK: chip-tool, the 1.6 data-model XML
 ```
 
-`rs-matter` is **our fork**, one commit ahead of upstream, and that commit is what
-adds the Thermostat, Electrical Power/Energy Measurement and Power Topology cluster
-handlers this firmware is built on. Neither `rs-matter-stack` nor `rs-matter-embassy`
-knows about the fork - they both pull `rs-matter` from crates.io - which is the whole
-reason `Cargo.toml` carries:
-
-```toml
-[patch.crates-io]
-rs-matter       = { path = "../rs-matter/rs-matter" }
-rs-matter-stack = { path = "../rs-matter-stack" }
-```
+The Thermostat, Electrical Power/Energy Measurement and Power Topology cluster
+handlers this firmware is built on were upstreamed into `rs-matter` main, but are
+in no crates.io release yet. Neither `rs-matter-stack` nor `rs-matter-embassy` knows
+that - they both pull `rs-matter` from crates.io - which is the whole reason
+`Cargo.toml` patches `rs-matter` to a pinned upstream git revision (and
+`rs-matter-stack` with it). Each patch has a commented-out `path` twin for developing
+against the sibling checkouts.
 
 **`../rs-matter/CLAUDE.md` is the authority for anything cluster- or spec-related**:
 how to look up conformance in `../connectedhomeip/data_model/1.6/clusters/*.xml`, the
 `ClusterHandler` / `<Cluster>Hooks` patterns, and the codegen rules. Read it before
-touching a `*Hooks` impl. `../rs-matter/WORK-REMAINING.md` records what is
-deliberately *not* implemented in the thermostat clusters (exported energy, presets
-and schedules, EPM `Ranges`, Power Topology beyond `NODE`) so nobody re-derives it.
+touching a `*Hooks` impl. Deliberately *not* implemented in the thermostat
+clusters: exported energy, presets and schedules, EPM `Ranges`, Power Topology
+beyond `NODE` - the module docs of each handler say so, so nobody re-derives it.
 
 The `esp-*` crates are also patched, to the single git revision
 `rs-matter-embassy/examples/esp/Cargo.toml` pins. They must all come from the same
@@ -125,8 +121,8 @@ src/boot_diag.rs   a manufacturer-specific cluster on EP0 serving why the board 
                    reset (`BootReason`, `ResetCause`)
 src/radio.rs       LoggedRadio: wraps `EspThreadDriver` to log when the BLE controller
                    and Thread come up and go down. Delegates; touches no hardware
-src/thermostat.rs  ThermostatHooks - heating-only, setpoints persisted, no control
-                   loop (the Mill owns that)
+src/thermostat.rs  ThermostatHooks - heating-only, no control loop (the Mill owns
+                   that); the handler owns and persists the attributes
 src/meter.rs       ElecPwrMeasHooks + ElecEnergyMeasHooks - what the element draws
 src/element.rs     ModeSelectHooks + a manufacturer-specific cluster on EP2: what the
                    element is *rated* at, which is the only thing the meter scales by
@@ -142,8 +138,9 @@ upstream moves:
   store (`get_persistent_store`) and the factory-reset-on-GPIO9 path.
 
 The cluster logic is a port of `../rs-matter/examples/src/bin/thermostat.rs`, with the
-KV-backed persistence shape taken from `../rs-matter/tests/src/bin/thermostat_tests.rs`
-and `../rs-matter/tests/src/common/vendor_kv.rs`.
+KV-backed persistence shape (for the state the handlers do not own - the energy
+counter and the custom element rating) taken from
+`../rs-matter/tests/src/common/vendor_kv.rs`.
 
 Re-exports worth knowing, so you never depend on `rs-matter` directly:
 `rs_matter_embassy::matter::*` **is** `rs-matter`, `rs_matter_embassy::stack::*` **is**
@@ -174,12 +171,19 @@ None of these is obvious from the code.
   (`OT_SRP_ECDSA_KEY`, `../rs-matter-embassy/rs-matter-embassy/src/ot.rs`). Ours start
   at `+1`. Note this differs from the `rs-matter` test drivers, which start at `+0`
   because they are not Thread devices - do not copy their key numbers.
+- **The Thermostat and Mode Select handlers persist their own attributes**, as TLV,
+  under the vendor keys `main.rs` hands their constructors
+  (`THERMOSTAT_ATTRS_KEY`, `ELEMENT_MODE_KEY`). Our hooks only mirror what they need,
+  and the handler restores its state at `Startup` *without* calling the hooks - which
+  is why `ElementWattsHandler::run` adopts `CurrentMode` from the handler before
+  anything else. `vendor_kv.rs` documents every key, including the retired `+1`; never
+  reuse a key, an old blob in a new format fails the handler's `Startup`.
 - **Factory reset does not clear our state for us.** `Matter::factory_reset` only
-  removes rs-matter's own keys (they grow *downwards* from `VENDOR_KEYS_START`), and
-  the `FactoryReset` lifecycle op does not reach the hooks - `ThermostatHooks`,
-  `ElecEnergyMeasHooks` and `ModeSelectHooks` have no lifecycle method. `main.rs`
-  removes the three vendor blobs explicitly; see the comment there before adding a
-  fourth.
+  removes rs-matter's own keys (they grow *downwards* from `VENDOR_KEYS_START`). The
+  Thermostat and Mode Select handlers would remove theirs on the `FactoryReset`
+  lifecycle op, but the reset chain in `main.rs` cannot include them, and
+  `ElecEnergyMeasHooks` has no lifecycle at all. `main.rs` removes every vendor key
+  explicitly; see the comment there before adding another.
 - **A KV write blocks the entire stack.** `SeqMapKvBlobStore` is an
   `embassy_futures::block_on` around `sequential-storage`, over an `esp-storage`
   `FlashStorage` that takes a critical section - cache off, interrupts off - for
@@ -330,8 +334,8 @@ None of these is obvious from the code.
 - **The restored setpoint limits are clamped to the absolute range.** Narrowing
   `heater.min/max_setpoint_celsius` on a commissioned device would otherwise leave the
   persisted `Min/MaxHeatSetpointLimit` outside `AbsMin/AbsMaxHeatSetpointLimit`, which
-  the cluster forbids. `ThermostatDeviceLogic::new` clamps on load; the stored value is
-  not preserved.
+  the cluster forbids. `ThermostatHandler`'s `repair()` clamps on load; the stored
+  value is not preserved.
 
 ### The Mill link
 
@@ -352,6 +356,12 @@ None of these is obvious from the code.
   call must *not* push the restored state onto the heater - somebody may have turned
   the knob while the board was rebooting - so `ThermostatDeviceLogic` skips the
   first `apply` and adopts the Mill's state from the first status frame instead.
+- **Sub-degree setpoints are rounded on the wire only.** A 21.50 degC write is
+  commanded as 22 but the attribute keeps 21.50, and a status frame counts as a
+  front-panel change only when its whole degree differs from the attribute's
+  rounding. Deliberate: Matter has no setpoint-step attribute, so "correcting" the
+  attribute to 22.00 would loop against any controller automation that steps in
+  half degrees - it rewrites 21.50, we correct, and so on.
 - **Commands are fire-and-forget.** No ack, no sequence number. A command is
   confirmed only by a later status frame echoing it, which is what the
   `pending_setpoint`/`pending_mode` grace window in `thermostat.rs` is for: a status

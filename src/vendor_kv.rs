@@ -13,29 +13,38 @@
 use rs_matter_embassy::matter::error::Error;
 use rs_matter_embassy::matter::persist::{KvBlobStoreAccess, VENDOR_KEYS_START};
 
-/// The Thermostat cluster's four non-volatile attributes, as seven bytes:
-/// `SystemMode` then `OccupiedHeatingSetpoint`, `MinHeatSetpointLimit` and
-/// `MaxHeatSetpointLimit` as little-endian `i16`s.
+/// Retired. Firmware from before `rs-matter`'s Thermostat handler took over its own
+/// persistence kept the cluster's four non-volatile attributes here, as seven raw
+/// bytes. `ThermostatDeviceLogic::new` removes the blob if it finds one, so the key
+/// must never be reused.
 ///
-/// Note the `+ 1`: `VENDOR_KEYS_START` itself is **not** free here. On a Thread
-/// device `rs-matter-embassy` stores OpenThread's SRP ECDSA key there
-/// (`OT_SRP_ECDSA_KEY` in `../rs-matter-embassy/rs-matter-embassy/src/ot.rs`), and
-/// stepping on it would cost the device its SRP identity on every boot.
-pub const THERMOSTAT_STATE_KEY: u16 = VENDOR_KEYS_START + 1;
+/// Note the `+ 1` all of these start from: `VENDOR_KEYS_START` itself is **not**
+/// free here. On a Thread device `rs-matter-embassy` stores OpenThread's SRP ECDSA
+/// key there (`OT_SRP_ECDSA_KEY` in `../rs-matter-embassy/rs-matter-embassy/src/ot.rs`),
+/// and stepping on it would cost the device its SRP identity on every boot.
+pub const LEGACY_THERMOSTAT_STATE_KEY: u16 = VENDOR_KEYS_START + 1;
 
 /// The heating element's lifetime energy counter, as a little-endian `i64` in
 /// milliwatt-seconds. Reported (divided down to mWh) as the Electrical Energy
 /// Measurement cluster's `CumulativeEnergyImported`.
 pub const HEATING_ELEMENT_ENERGY_KEY: u16 = VENDOR_KEYS_START + 2;
 
-/// Which plate rating the element has been told it has, as three bytes: the Mode
-/// Select `CurrentMode` then the custom wattage as a little-endian `u16`.
+/// The element's custom rating - the figure `ElementWatts` takes - as a
+/// little-endian `u16`.
 ///
-/// Both halves in one blob on purpose. They are written together and read together,
-/// a custom wattage being meaningful only while `CurrentMode` selects it, and each
-/// `store_blob` stops the radio and the Mill UART for the length of a flash write,
-/// so one key costs half what two would.
+/// Older firmware kept the Mode Select `CurrentMode` in front of it, as three bytes;
+/// `element.rs` reads that form once, hands the mode to [`ELEMENT_MODE_KEY`]'s owner
+/// and rewrites the blob.
 pub const ELEMENT_RATING_KEY: u16 = VENDOR_KEYS_START + 3;
+
+/// Owned by `rs-matter`'s `ThermostatHandler`, which persists `SystemMode`, the
+/// setpoints and the setpoint limits here as TLV. We only choose the key, and clear
+/// it on a factory reset.
+pub const THERMOSTAT_ATTRS_KEY: u16 = VENDOR_KEYS_START + 4;
+
+/// Owned by `rs-matter`'s `ModeSelectHandler` on EP2, which persists `CurrentMode`
+/// here as TLV. Likewise ours only to choose and to clear.
+pub const ELEMENT_MODE_KEY: u16 = VENDOR_KEYS_START + 5;
 
 /// An object-safe view of a [`KvBlobStoreAccess`].
 ///
